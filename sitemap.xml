@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://wangzijian1010.github.io/my-blog/</loc><lastmod>2026-05-06</lastmod></url>
-  <url><loc>https://wangzijian1010.github.io/my-blog/archive.html</loc><lastmod>2026-05-06</lastmod></url>
+  <url><loc>https://wangzijian1010.github.io/my-blog/</loc><lastmod>2026-05-07</lastmod></url>
+  <url><loc>https://wangzijian1010.github.io/my-blog/archive.html</loc><lastmod>2026-05-07</lastmod></url>
+  <url><loc>https://wangzijian1010.github.io/my-blog/posts/lite-ai-performance.html</loc><lastmod>2026-05-07</lastmod></url>
   <url><loc>https://wangzijian1010.github.io/my-blog/posts/yolov8n-tensorrt-single-inference.html</loc><lastmod>2026-05-06</lastmod></url>
   <url><loc>https://wangzijian1010.github.io/my-blog/posts/interview-loop.html</loc><lastmod>2026-05-01</lastmod></url>
 </urlset>

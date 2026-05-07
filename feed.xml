@@ -6,7 +6,14 @@
     <link>https://wangzijian1010.github.io/my-blog/</link>
     <atom:link href="https://wangzijian1010.github.io/my-blog/feed.xml" rel="self" type="application/rss+xml" />
     <language>zh-CN</language>
-    <lastBuildDate>Wed, 06 May 2026 00:00:00 +0800</lastBuildDate>
+    <lastBuildDate>Thu, 07 May 2026 00:00:00 +0800</lastBuildDate>
+    <item>
+      <title>lite.ai.performance：TensorRT 推理管线优化</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/lite-ai-performance.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/lite-ai-performance.html</guid>
+      <description>把 YOLO TensorRT 推理优化落到 lite.ai.toolkit：GPU 前处理、GPU 后处理、FP16 IO 和端到端性能模式。</description>
+      <pubDate>Thu, 07 May 2026 00:00:00 +0800</pubDate>
+    </item>
     <item>
       <title>YOLOv8n 单次推理延迟优化实验</title>
       <link>https://wangzijian1010.github.io/my-blog/posts/yolov8n-tensorrt-single-inference.html</link>

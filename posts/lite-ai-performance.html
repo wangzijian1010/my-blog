@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>lite.ai.performance：TensorRT 推理管线优化 | 慢慢写</title>
+    <meta
+      name="description"
+      content="把 YOLO TensorRT 推理优化落到 lite.ai.toolkit：GPU 前处理、GPU 后处理、FP16 IO 和端到端性能模式。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="lite.ai.performance：TensorRT 推理管线优化">
+    <meta property="og:description" content="把 YOLO TensorRT 推理优化落到 lite.ai.toolkit：GPU 前处理、GPU 后处理、FP16 IO 和端到端性能模式。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/lite-ai-performance.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../index.html#posts">Posts</a>
+        <a href="../archive.html">Archive</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">lite.ai.performance</p>
+          <h1>lite.ai.performance：TensorRT 推理管线优化</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-07">2026.05.07</time>
+            <span>lite.ai</span>
+            <span>TensorRT</span>
+            <span>CUDA</span>
+            <span>性能优化</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          昨天的 YOLO 单次推理实验验证了一个方向：如果只优化 TensorRT engine，
+          很快会被 CPU 预处理、CPU 后处理、H2D/D2H 拷贝和同步点挡住。今天做的是把这套思路落到
+          <code>lite.ai.toolkit</code> 里，给 TensorRT YOLO 管线加一个真正面向延迟的 performance path。
+        </p>
+
+        <p>
+          目标是让 <code>TRTYoloV8</code> 的端到端延迟接近参考实现
+          <code>/workspace/yolo_fast/infer_gpu.cu</code> 的 1ms 级别。最终 FP16 engine 下，
+          新 GPU 管线 E2E 为 <strong>891us</strong>，GPU 耗时约 <strong>872us</strong>；
+          相比原始 CPU 前后处理管线的 <strong>44,978us</strong>，约 <strong>50 倍加速</strong>。
+        </p>
+
+        <h2>原管线的问题</h2>
+
+        <p>
+          原来的 <code>TRTYoloV8::detect()</code> 不是慢在某一个单点，而是整条链路都在付额外成本。
+          图像先在 CPU 上做 <code>cvtColor</code>、<code>resize</code>、<code>convertTo</code>、
+          HWC 到 CHW，再把 FP32 tensor 拷到 GPU。TensorRT 推理之后，又把完整输出 tensor 拷回 CPU，
+          在 CPU 上遍历 8400 个 anchor，生成候选框并做 NMS。
+        </p>
+
+        <p>
+          这条路径还有两个隐藏问题：一是 <code>enqueueV3</code> 前后存在多余同步；
+          二是即使 engine 是 FP16，输入侧也没有完整的 FP16 IO 支持。也就是说，模型算得再快，
+          也会被 CPU 计算、内存拷贝和同步点稀释掉。
+        </p>
+
+        <blockquote>
+          这次优化的核心不是再换一个更快的 engine，而是把 CPU 夹在推理链路中间的工作尽量搬走。
+        </blockquote>
+
+        <h2>新的数据流</h2>
+
+        <p>
+          新增的 <code>detectGPU()</code> 直接围绕设备端数据组织：原始图像以 uint8 形式进入 GPU，
+          GPU kernel 完成前处理，TensorRT 直接消费 FP16 或 FP32 输入 tensor，候选框生成和 NMS 也尽量留在 GPU 端。
+        </p>
+
+        <pre><code>d_raw(uint8, GPU)
+  -> GPU preprocess kernel
+     resize + BGR->RGB + normalize + HWC->CHW + FP16/FP32
+  -> trt_context->enqueueV3(stream)
+  -> GPU bbox generation
+     8400 anchors -> device bbox buffer
+  -> GPU NMS
+  -> D2H copy final boxes</code></pre>
+
+        <p>
+          这样改完之后，端到端路径里最重的 CPU 操作被移除：不再在 CPU 上构造输入 tensor，
+          不再把完整 raw output 拉回 CPU 遍历，也不再在 CPU 上执行 NMS。CPU 主要负责启动 kernel、
+          管理 buffer、同步和取最终结果。
+        </p>
+
+        <h2>GPU 前处理</h2>
+
+        <p>
+          前处理被合并成一个 CUDA kernel，单次 launch 完成 letterbox resize、BGR 到 RGB、归一化、
+          HWC 到 CHW 和类型转换。这里同时提供 FP16 和 FP32 两种输出变体：FP16 engine 直接写
+          <code>half*</code> 输入，FP32 engine 写 <code>float*</code> 输入。
+        </p>
+
+        <pre><code>// FP16: 写入 half* dst
+preprocess_kernel&lt;&lt;&lt;grid, block, 0, stream&gt;&gt;&gt;(...)
+
+// FP32: 写入 float* dst
+preprocess_kernel_fp32&lt;&lt;&lt;grid, block, 0, stream&gt;&gt;&gt;(...)</code></pre>
+
+        <p>
+          这一步的意义和昨天 FP16 IO 的实验对应：如果 engine 输入 binding 本来就是 FP16，
+          就不要在 CPU 上生成 FP32 tensor 再传过去。直接在 GPU 上生成 FP16 CHW tensor，
+          能减少输入数据量，也能省掉额外转换。
+        </p>
+
+        <h2>FP16 输入支持</h2>
+
+        <p>
+          原实现里 FP16 engine 的输入支持不完整，甚至会出现按 FP16 大小分配 buffer，
+          但仍按 FP32 数据拷贝的情况。这会造成缓冲区溢出，也解释了旧管线里异常的检出数量。
+        </p>
+
+        <p>
+          新实现通过 TensorRT 的 <code>getTensorDataType()</code> 自动识别输入类型，
+          再按 <code>sizeof(half)</code> 或 <code>sizeof(float)</code> 分配输入 buffer。
+          对动态 shape，先 <code>setInputShape</code>，再绑定地址，并使用
+          <code>getTensorShape()</code> 获取实际维度。
+        </p>
+
+        <h2>GPU 后处理和 NMS</h2>
+
+        <p>
+          YOLOv8 后处理也搬到 GPU。候选框生成 kernel 让每个线程处理一个 anchor，
+          对 80 个类别分数取最大值作为置信度，符合阈值的候选框直接写入设备端数组。
+          后续 GPU NMS 直接消费这块设备内存，中间不需要把完整输出 tensor 拷回 CPU。
+        </p>
+
+        <p>
+          NMS 前会把内部的 <code>BoundingBoxType&lt;float, float&gt;</code> 打包成更适合 kernel 处理的
+          5-float 数组，然后在 GPU 上做逐类别 NMS。最终只把少量保留框和索引拷回 CPU。
+          这和昨天端到端 NMS 实验的结论一致：真正贵的不是几个最终框，而是把大输出搬回 CPU 再处理。
+        </p>
+
+        <h2>性能结果</h2>
+
+        <p>
+          测试环境是 RTX 3080 Ti，模型为 YOLOv8n，输入图像 810 x 1080，
+          置信度阈值 0.25，IOU 阈值 0.45，topk 为 100。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Engine</th>
+                <th>Pipeline</th>
+                <th>E2E 延迟</th>
+                <th>GPU 耗时</th>
+                <th>检出数</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>FP16</td>
+                <td>旧：CPU 前后处理</td>
+                <td>44,978us</td>
+                <td>—</td>
+                <td>2750*</td>
+              </tr>
+              <tr>
+                <td>FP16</td>
+                <td><strong>新：GPU 前后处理</strong></td>
+                <td><strong>891us</strong></td>
+                <td><strong>872us</strong></td>
+                <td>5</td>
+              </tr>
+              <tr>
+                <td>FP32</td>
+                <td>旧：CPU 前后处理</td>
+                <td>44,745us</td>
+                <td>—</td>
+                <td>2750*</td>
+              </tr>
+              <tr>
+                <td>FP32</td>
+                <td><strong>新：GPU 前后处理</strong></td>
+                <td><strong>1,505us</strong></td>
+                <td><strong>1,462us</strong></td>
+                <td>5</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          星号对应旧管线的 FP16 数据类型 bug：输出数量异常不代表真实检测质量，
+          而是 buffer 和 dtype 不匹配带来的错误结果。修复 dtype 后，新管线的检出数恢复正常。
+        </p>
+
+        <h2>延迟分解</h2>
+
+        <p>FP16 新管线的主要耗时分布如下：</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>阶段</th>
+                <th>耗时</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>GPU 预处理 kernel</td>
+                <td>~10us</td>
+              </tr>
+              <tr>
+                <td>TRT enqueueV3</td>
+                <td>~800us</td>
+              </tr>
+              <tr>
+                <td>GPU 后处理 kernel</td>
+                <td>~20us</td>
+              </tr>
+              <tr>
+                <td>GPU NMS</td>
+                <td>~40us</td>
+              </tr>
+              <tr>
+                <td><strong>GPU 总计</strong></td>
+                <td><strong>~872us</strong></td>
+              </tr>
+              <tr>
+                <td>CPU 开销：memcpy、sync 等</td>
+                <td>~19us</td>
+              </tr>
+              <tr>
+                <td><strong>E2E 总计</strong></td>
+                <td><strong>~891us</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          这个结果已经和参考实现的 1ms 级别接近。继续压均值延迟时，重点不再是“把 Python 换成 C++”
+          这种大块收益，而是减少同步点、合并后处理和 NMS、以及确认输入输出拷贝是否还能被流水线隐藏。
+        </p>
+
+        <h2>改动范围</h2>
+
+        <p>
+          这次改动主要集中在三层：TensorRT handler 层补齐 dtype 和动态 shape 支持；
+          CUDA kernel 层新增 GPU 前处理、YOLO 后处理和 GPU NMS；CV API 层给 YOLOv8/YOLOv5 增加
+          <code>detectGPU()</code> 入口。CMake 也把 CUDA 架构调整为 sm_86，以适配 RTX 3080 Ti。
+        </p>
+
+        <p>
+          文件数量看起来不少，但边界是清楚的：原有 <code>detect()</code> 路径保留，
+          新的 performance path 通过 <code>detectGPU()</code> 进入，避免把低延迟实现和兼容性路径混在一起。
+        </p>
+
+        <h2>已知限制</h2>
+
+        <ol>
+          <li>YOLOv5 的 <code>detectGPU()</code> 代码路径已经补上，但当前环境没有 YOLOv5 engine，尚未实测。</li>
+          <li>YOLOv11 还没有适配 GPU 检测路径，仍然走 CPU 检测逻辑。</li>
+          <li>当前 <code>detectGPU()</code> 仍有同步点，后续可以考虑把后处理和 NMS 合并，或用 CUDA Graph 收敛调度开销。</li>
+          <li>这次测试聚焦单图低延迟，批量吞吐和多 stream 场景还需要单独 benchmark。</li>
+        </ol>
+
+        <h2>总结</h2>
+
+        <p>
+          这次优化最重要的判断是：lite.ai.toolkit 的 TensorRT YOLO 路径，瓶颈不只是 engine 推理本身。
+          旧管线把太多工作留在 CPU，并且反复跨越 CPU/GPU 边界。新的 performance path 把前处理、候选框生成和 NMS
+          放到 GPU 上，同时补齐 FP16 输入支持，把端到端延迟压到 891us。
+        </p>
+
+        <p>
+          这也验证了昨天 YOLO 单次推理实验里的结论：当模型已经进入 TensorRT FP16 的 1ms 区间后，
+          真正决定 E2E 的往往是 pipeline，而不是单独的 GPU compute。
+        </p>
+
+        <footer class="post-footer">
+          <a href="../index.html">Back to all posts</a>
+        </footer>
+      </article>
+    </main>
+  </body>
+</html>

@@ -1,7 +1,7 @@
 import { readFile, writeFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
-const SITE_URL = process.env.SITE_URL ?? "https://example.com";
+const SITE_URL = process.env.SITE_URL ?? "https://wangzijian1010.github.io/my-blog";
 const SITE_TITLE = "慢慢写";
 const SITE_DESC = "面试复盘、技术观察和日常小感悟。";
 const READ_CPM = 350; // chars per minute, mixed zh/en
