@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>YOLOv8n 单次推理延迟优化实验 | 慢慢写</title>
+    <meta
+      name="description"
+      content="一次 YOLOv8n TensorRT 单次推理延迟优化记录：从 PyTorch 8.9ms 到 C++ GPU Pipeline 1.17ms。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="YOLOv8n 单次推理延迟优化实验">
+    <meta property="og:description" content="一次 YOLOv8n TensorRT 单次推理延迟优化记录：从 PyTorch 8.9ms 到 C++ GPU Pipeline 1.17ms。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/yolov8n-tensorrt-single-inference.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../index.html#posts">Posts</a>
+        <a href="../archive.html">Archive</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">inference note</p>
+          <h1>YOLOv8n 单次推理延迟优化实验</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-06">2026.05.06</time>
+            <span>YOLO</span>
+            <span>TensorRT</span>
+            <span>CUDA</span>
+            <span>推理优化</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          这次实验的目标很单纯：把 YOLOv8n 在 batch=1、imgsz=640 下的单次推理延迟尽可能压低。
+          测试环境是 RTX 3080 Ti、TensorRT 10.6、CUDA 13.0，验证集使用 COCO128。
+        </p>
+
+        <p>
+          最终结果是：PyTorch FP32 pipeline 的端到端延迟为 8.9ms；经过 TensorRT FP16、端到端 NMS、
+          FP16 输入、GPU 预处理和 C++ pipeline 之后，E2E 降到 1.17ms，约 7.6 倍加速。
+        </p>
+
+        <h2>先看完整结果</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Pipeline</th>
+                <th>mAP50</th>
+                <th>mAP50-95</th>
+                <th>Pre</th>
+                <th>Infer</th>
+                <th>Post</th>
+                <th>E2E</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>PyTorch FP32 .pt</td>
+                <td>60.4</td>
+                <td>45.1</td>
+                <td>1.0ms</td>
+                <td>6.8ms</td>
+                <td>1.1ms</td>
+                <td><strong>8.9ms</strong></td>
+              </tr>
+              <tr>
+                <td>TRT FP32 engine</td>
+                <td>60.4</td>
+                <td>45.1</td>
+                <td>0.9ms</td>
+                <td>1.8ms</td>
+                <td>1.2ms</td>
+                <td><strong>3.9ms</strong></td>
+              </tr>
+              <tr>
+                <td>TRT FP16 engine</td>
+                <td>60.4</td>
+                <td>44.9</td>
+                <td>0.9ms</td>
+                <td>1.2ms</td>
+                <td>1.1ms</td>
+                <td><strong>3.2ms</strong></td>
+              </tr>
+              <tr>
+                <td>TRT INT8 engine</td>
+                <td>59.7</td>
+                <td>44.3</td>
+                <td>0.9ms</td>
+                <td>1.1ms</td>
+                <td>1.1ms</td>
+                <td><strong>3.1ms</strong></td>
+              </tr>
+              <tr>
+                <td>TRT FP16 NMS</td>
+                <td>59.2</td>
+                <td>44.0</td>
+                <td>0.9ms</td>
+                <td>2.0ms</td>
+                <td>0.2ms</td>
+                <td><strong>3.1ms</strong></td>
+              </tr>
+              <tr>
+                <td><strong>C++ GPU Pipeline</strong></td>
+                <td>59.2</td>
+                <td>44.0</td>
+                <td><strong>0.01ms</strong></td>
+                <td><strong>1.02ms</strong></td>
+                <td><strong>0ms</strong></td>
+                <td><strong>1.17ms</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          前三步说明了一件事：只做 engine 精度量化，很快就会摸到上限。FP32 到 FP16 的收益很明显，
+          但 FP16 到 INT8 只把 infer 从 1.2ms 压到 1.1ms。此时 Pre + Post 仍然接近 2ms，
+          已经比模型本身更像瓶颈。
+        </p>
+
+        <h2>EfficientNMS 的收益和误区</h2>
+
+        <p>
+          我用 <code>yolo export nms=True</code> 导出端到端 ONNX，再通过 TensorRT build 成 engine。
+          ONNX 输入是 <code>[1,3,640,640]</code>，输出变成 <code>[1,300,6]</code>。
+          相比 raw 输出 <code>[1,84,8400]</code>，D2H 数据量从约 705K floats 变成 1.8K floats，
+          大约缩小 392 倍。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>指标</th>
+                <th>FP16 raw</th>
+                <th>FP16 NMS</th>
+                <th>变化</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>GPU Compute</td>
+                <td>0.80ms</td>
+                <td>0.79ms</td>
+                <td>基本不变</td>
+              </tr>
+              <tr>
+                <td>D2H</td>
+                <td>0.23ms</td>
+                <td>0.005ms</td>
+                <td>下降约 98%</td>
+              </tr>
+              <tr>
+                <td>Mean Latency</td>
+                <td>1.46ms</td>
+                <td>1.21ms</td>
+                <td>下降约 17%</td>
+              </tr>
+              <tr>
+                <td>Throughput</td>
+                <td>1131 QPS</td>
+                <td>817 QPS</td>
+                <td>下降</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          裸 engine 看起来不错：D2H 几乎没了，平均 latency 也下降。但放回 Ultralytics pipeline 后，
+          结果没有想象中漂亮。Postprocess 从 1.1ms 降到 0.2ms，确实达成目标；
+          但 NMS 被计入 inference，infer 从 1.2ms 增加到 2.0ms，最后 E2E 只从 3.2ms 到 3.1ms。
+        </p>
+
+        <blockquote>
+          NMS 的主要收益不是“计算免费”，而是输出变小，CPU 后处理和 D2H 传输变便宜。
+        </blockquote>
+
+        <p>
+          这里还有一个精度坑：第一次导出时使用了默认 <code>conf=0.25</code>，低分框被提前过滤，
+          mAP50 从 60.4 掉到 47.9。验证时应该用 <code>conf=0.001</code> 导出。
+          修复后 mAP50 为 59.2，mAP50-95 为 44.0。Precision 上升、Recall 下降，
+          主要来自 ONNX <code>NonMaxSuppression</code> 和 TorchNMS 的实现差异。
+        </p>
+
+        <h2>FP16 输入是便宜收益</h2>
+
+        <p>
+          接下来把输入 binding 从 FP32 改成 FP16。640 x 640 x 3 的输入从 4.9MB 变成 2.45MB，
+          H2D 理论上应该接近减半，实测也基本符合预期。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Metric</th>
+                <th>FP32 IO</th>
+                <th>FP16 IO</th>
+                <th>变化</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>H2D Latency</td>
+                <td>0.405ms</td>
+                <td>0.208ms</td>
+                <td>下降 49%</td>
+              </tr>
+              <tr>
+                <td>GPU Compute</td>
+                <td>0.788ms</td>
+                <td>0.795ms</td>
+                <td>基本不变</td>
+              </tr>
+              <tr>
+                <td>Mean Latency</td>
+                <td>1.184ms</td>
+                <td>1.013ms</td>
+                <td>下降 14%</td>
+              </tr>
+              <tr>
+                <td>Throughput</td>
+                <td>834 QPS</td>
+                <td>970 QPS</td>
+                <td>上升 16%</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          这一步几乎没有副作用。图像原始值是 0 到 255，normalize 到 0 到 1 后仍然在 FP16 可以表达的范围内。
+          对单次推理来说，它稳定省下约 0.2ms，让 trtexec 裸延迟第一次接近 1ms。
+        </p>
+
+        <h2>真正拉开差距的是 C++ GPU Pipeline</h2>
+
+        <p>
+          Python/Ultralytics pipeline 里，CPU 预处理、Python 调度和后处理已经成为主要成本。
+          所以后面改成 C++ TensorRT API，并把预处理放到 CUDA kernel 上做。
+        </p>
+
+        <pre><code>CPU: stb_image(RGB) -> H2D raw uint8
+GPU: resize + HWC->CHW + normalize -> TRT enqueueV3 -> D2H detections</code></pre>
+
+        <p>
+          预处理 kernel 每个 thread 处理一个输出像素，完成 bilinear resize、HWC uint8 到 CHW FP16、
+          normalize 到 0 到 1。输入直接用 RGB，省掉 BGR/RGB 转换。非默认 stream 也避免了一部分同步开销。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>指标</th>
+                <th>延迟</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>GPU Preprocess</td>
+                <td><strong>9.75us</strong></td>
+                <td>相比 Python CPU 0.9ms，约 93 倍加速</td>
+              </tr>
+              <tr>
+                <td>TRT Inference</td>
+                <td>1.024ms</td>
+                <td>包含 GPU compute 和 NMS</td>
+              </tr>
+              <tr>
+                <td>Pre + Infer</td>
+                <td>1.041ms</td>
+                <td>CUDA event 测量</td>
+              </tr>
+              <tr>
+                <td>E2E wall</td>
+                <td><strong>1.168ms</strong></td>
+                <td>包含 H2D、preprocess、infer、D2H</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          这一步把 Python TRT pipeline 的 3.1ms 压到 1.17ms，下降约 62%；
+          对比最初的 PyTorch FP32 pipeline，则是 8.9ms 到 1.17ms，下降约 87%。
+        </p>
+
+        <h2>没有收益的实验也有价值</h2>
+
+        <p>
+          CUDA Graph 和 SpinWait 在这次场景里都没有收益。FP16 NMS engine 上，baseline、
+          <code>--useCudaGraph</code>、<code>--useSpinWait</code> 的 mean latency 都在 1.18ms 到 1.19ms 附近。
+          原因是 <code>Enqueue ≈ H2D + GPU + D2H</code>，说明 TensorRT 10.x 已经把模型编译成高度融合的执行图，
+          单图固定 shape 推理里没有多少 per-kernel launch overhead 可以省。
+        </p>
+
+        <p>
+          <code>onnxsim</code> 也没有带来变化。节点数从 288 到 288，说明 Ultralytics 内置的
+          <code>onnxslim</code> 已经完成了能做的 constant folding 和冗余节点消除。
+        </p>
+
+        <h2>当前瓶颈</h2>
+
+        <p>C++ GPU pipeline 的 1.17ms 现在大致分成这几块：</p>
+
+        <pre><code>GPU Compute (TRT + NMS) 0.80ms  68%
+H2D raw uint8          0.21ms  18%
+CPU overhead           0.15ms  13%
+GPU Preprocess         0.01ms   1%
+D2H detections         0.01ms   1%</code></pre>
+
+        <p>
+          也就是说，GPU compute 已经是主导项，接近这个模型和输入尺寸下的物理下限。
+          继续优化 Python、后处理、图简化，收益都不会太大。真正还可能有收益的方向，
+          要么降低输入分辨率，要么换模型结构，要么做 Ampere 2:4 structured sparsity。
+          如果目标是稳定性而不是均值延迟，GPU clock lock 和 P99  profiling 会更重要。
+        </p>
+
+        <h2>这次实验的结论</h2>
+
+        <ol>
+          <li>TensorRT FP16 是第一优先级优化：延迟从 8.9ms 到 3.2ms，精度基本不变。</li>
+          <li>INT8 对 YOLOv8n 单 batch 收益有限：infer 只从 1.2ms 到 1.1ms，还牺牲一点 mAP。</li>
+          <li>端到端 NMS 主要减少 D2H 和 CPU postprocess，但验证级 <code>conf=0.001</code> 下不会带来明显 E2E 净收益。</li>
+          <li>FP16 IO 是低风险收益：H2D 下降约 49%，单次推理省约 0.2ms。</li>
+          <li>C++ GPU pipeline 才是关键：GPU 预处理 + TRT API 消除 Python overhead 后，E2E 到 1.17ms。</li>
+          <li>当前瓶颈已经回到 GPU compute。后续优化应优先考虑分辨率、模型结构、稀疏化和流水线重叠。</li>
+        </ol>
+
+        <footer class="post-footer">
+          <a href="../index.html">Back to all posts</a>
+        </footer>
+      </article>
+    </main>
+  </body>
+</html>

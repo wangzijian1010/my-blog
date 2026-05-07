@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>面试不是考试：一次前端面试复盘 | 慢慢写</title>
+    <meta
+      name="description"
+      content="一篇 demo 博客文章，复盘一次前端面试里被真正考察的沟通和判断。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="面试不是考试：一次前端面试复盘">
+    <meta property="og:description" content="一篇 demo 博客文章，复盘一次前端面试里被真正考察的沟通和判断。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/interview-loop.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../index.html#posts">Posts</a>
+        <a href="../archive.html">Archive</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">interview note</p>
+          <h1>面试不是考试：一次前端面试复盘</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-01">2026.05.01</time>
+            <span>面试</span>
+            <span>前端</span>
+            <span>复盘</span>
+          </p>
+        </header>
+
+        <p>
+          这次面试结束后，我最强烈的感觉不是哪道题没答上来，而是我太晚才意识到：
+          对方并不只是在等一个标准答案。他更想看见我如何缩小问题、暴露假设、判断取舍。
+        </p>
+
+        <p>
+          题目本身很普通：做一个可筛选、可排序的列表组件。换成刷题语境，它像是状态管理和性能优化的组合题。
+          但真正让我卡住的地方，是我一上来就试图给出“完整方案”，反而漏掉了最该先问的三个约束。
+        </p>
+
+        <h2>我应该先问什么</h2>
+
+        <p>如果重来一次，我会先把问题拆成三句话：</p>
+
+        <ol>
+          <li>数据规模大概是多少，是几十条、几千条，还是需要服务端分页？</li>
+          <li>排序和筛选规则是否要同步到 URL，方便分享和刷新恢复？</li>
+          <li>这个列表更重视首次可用速度，还是更重视后续交互的稳定流畅？</li>
+        </ol>
+
+        <p>
+          这些问题看起来不像“技术点”，但它们决定技术点。没有数据规模，虚拟列表就是表演；
+          没有 URL 状态要求，路由同步就是负担；没有交互优先级，优化也容易变成自我感动。
+        </p>
+
+        <blockquote>
+          面试里最容易输的不是不会，而是急着证明自己会。
+        </blockquote>
+
+        <h2>后来我怎么答</h2>
+
+        <p>
+          我把方案收回来，重新讲了一个更小的版本：先把原始数据、筛选条件、排序条件分开；
+          派生结果用 memo 做边界；URL 同步留成可插拔的一层；如果数据规模超过前端舒适区，再把筛选和排序交给接口。
+        </p>
+
+        <p>
+          这不是最炫的答案，但它开始像一个可以合作的答案。面试官追问边界情况时，
+          我也能沿着同一套结构继续往下走，而不是每问一次就临时换一个脑内模型。
+        </p>
+
+        <h2>给下次的提醒</h2>
+
+        <p>
+          下次遇到开放题，我想先停三秒。先复述目标，再补齐约束，最后给一个最小可行方案。
+          如果还有时间，再讲我会如何扩展它。
+        </p>
+
+        <p>
+          面试当然有运气成分，但表达方式是可以训练的。训练的方向不是把每个答案背得更像答案，
+          而是让别人看见：我知道自己在判断什么。
+        </p>
+
+        <footer class="post-footer">
+          <a href="../index.html">Back to all posts</a>
+        </footer>
+      </article>
+    </main>
+  </body>
+</html>

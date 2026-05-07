@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>慢慢写</title>
+    <meta
+      name="description"
+      content="一个写面试复盘、技术观察和日常小感悟的个人博客 demo。"
+    >
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="慢慢写">
+    <meta property="og:description" content="一个写面试复盘、技术观察和日常小感悟的个人博客 demo。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="feed.xml">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="index.html" aria-current="page">Home</a>
+        <a href="#posts">Posts</a>
+        <a href="archive.html">Archive</a>
+        <a href="#about">About</a>
+        <a href="feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="shell">
+      <section class="intro" aria-labelledby="site-title">
+        <p class="eyebrow">interviews, code, ordinary days</p>
+        <h1 id="site-title">把面试和日常都写成可复盘的东西。</h1>
+        <p>
+          这里不急着证明什么。记录一些真实的准备、失误、判断和小变化。
+          技术文章讲清楚上下文，随笔留下当时的语气。页面尽量安静，把注意力让给文字。
+        </p>
+      </section>
+
+      <div class="content-grid">
+        <section id="posts" class="post-list" aria-labelledby="posts-title">
+          <h2 id="posts-title">Latest</h2>
+          <!-- POSTS:START -->
+          <article class="list-item">
+            <time datetime="2026-05-06">2026.05.06 · 约 11 分钟</time>
+            <div>
+              <h3>
+                <a href="posts/yolov8n-tensorrt-single-inference.html">YOLOv8n 单次推理延迟优化实验</a>
+              </h3>
+              <p>
+                一次 YOLOv8n TensorRT 单次推理延迟优化记录：从 PyTorch 8.9ms 到 C++ GPU Pipeline 1.17ms。
+              </p>
+              <p class="tags">
+                <span>YOLO</span>
+                <span>TensorRT</span>
+                <span>CUDA</span>
+                <span>推理优化</span>
+              </p>
+            </div>
+          </article>
+
+          <article class="list-item">
+            <time datetime="2026-05-01">2026.05.01 · 约 2 分钟</time>
+            <div>
+              <h3>
+                <a href="posts/interview-loop.html">面试不是考试：一次前端面试复盘</a>
+              </h3>
+              <p>
+                一篇 demo 博客文章，复盘一次前端面试里被真正考察的沟通和判断。
+              </p>
+              <p class="tags">
+                <span>面试</span>
+                <span>前端</span>
+                <span>复盘</span>
+              </p>
+            </div>
+          </article>
+          <!-- POSTS:END -->
+        </section>
+
+        <aside id="about" class="side-note" aria-labelledby="about-title">
+          <h2 id="about-title">About</h2>
+          <p>
+            写代码的人，也在练习把想法说清楚。这里适合放面试复盘、技术笔记、
+            项目手记和一点日常观察。
+          </p>
+
+          <h2>Writing Rule</h2>
+          <ol>
+            <li>先写发生了什么，再写我怎么看。</li>
+            <li>少写正确答案，多写判断过程。</li>
+            <li>标题可以小，但问题要具体。</li>
+          </ol>
+        </aside>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        A quiet blog demo. References:
+        <a href="https://bilibi.li">bilibi.li</a>,
+        <a href="https://overreacted.io">overreacted</a>,
+        <a href="https://antfu.me">antfu.me</a>,
+        <a href="https://jvns.ca">jvns.ca</a>.
+      </p>
+    </footer>
+  </body>
+</html>

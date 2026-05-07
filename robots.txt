@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://wangzijian1010.github.io/my-blog/sitemap.xml

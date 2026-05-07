@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>慢慢写</title>
+    <description>面试复盘、技术观察和日常小感悟。</description>
+    <link>https://wangzijian1010.github.io/my-blog/</link>
+    <atom:link href="https://wangzijian1010.github.io/my-blog/feed.xml" rel="self" type="application/rss+xml" />
+    <language>zh-CN</language>
+    <lastBuildDate>Wed, 06 May 2026 00:00:00 +0800</lastBuildDate>
+    <item>
+      <title>YOLOv8n 单次推理延迟优化实验</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/yolov8n-tensorrt-single-inference.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/yolov8n-tensorrt-single-inference.html</guid>
+      <description>一次 YOLOv8n TensorRT 单次推理延迟优化记录：从 PyTorch 8.9ms 到 C++ GPU Pipeline 1.17ms。</description>
+      <pubDate>Wed, 06 May 2026 00:00:00 +0800</pubDate>
+    </item>
+    <item>
+      <title>面试不是考试：一次前端面试复盘</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/interview-loop.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/interview-loop.html</guid>
+      <description>一篇 demo 博客文章，复盘一次前端面试里被真正考察的沟通和判断。</description>
+      <pubDate>Fri, 01 May 2026 00:00:00 +0800</pubDate>
+    </item>
+  </channel>
+</rss>
