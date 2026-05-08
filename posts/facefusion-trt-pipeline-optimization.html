@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FaceFusion TensorRT 换脸管线优化设想 | 慢慢写</title>
+    <meta
+      name="description"
+      content="一个尚未实测的 FaceFusion 换脸算法优化思路：从 source / target 链路并行、CUDA stream 到多脸 batching。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="FaceFusion TensorRT 换脸管线优化设想">
+    <meta property="og:description" content="一个尚未实测的 FaceFusion 换脸算法优化思路：从 source / target 链路并行、CUDA stream 到多脸 batching。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/facefusion-trt-pipeline-optimization.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../index.html#posts">Posts</a>
+        <a href="../archive.html">Archive</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">facefusion note</p>
+          <h1>FaceFusion TensorRT 换脸管线优化设想</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-08">2026.05.08</time>
+            <span>FaceFusion</span>
+            <span>TensorRT</span>
+            <span>CUDA</span>
+            <span>Pipeline</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          这篇先不是 benchmark，而是一份准备验证的优化思路。FaceFusion 的换脸链路里，
+          source 和 target 在进入 <code>face_swap</code> 之前基本是两条独立支路；
+          如果它们都被同一组 TensorRT context 串行执行，GPU 中间就会留下不少等待 CPU 和等待 context 的空档。
+        </p>
+
+        <p>
+          当前的直觉是：不要一上来继续抠单个模型的 engine，而是先看整条 pipeline 有没有被调度方式限制住。
+          对 batch=1 的换脸任务来说，模型推理很可能不是唯一瓶颈。CPU preprocess、postprocess、
+          Host-Device 拷贝、CUDA stream 同步、TensorRT context 争用，都可能把 engine 本身的收益吃掉。
+        </p>
+
+        <blockquote>
+          这次优化的核心假设是：source / target 两条链路的依赖关系，比单个模型的算子速度更值得先处理。
+        </blockquote>
+
+        <h2>当前链路</h2>
+
+        <p>
+          一个典型 FaceFusion TRT pipeline 大致可以拆成 5 个模型：
+          <code>face_detect</code>、<code>face_landmarks</code>、<code>face_recognizer</code>、
+          <code>face_swap</code> 和 <code>face_restoration</code>。
+          source 侧需要检测、人脸关键点和 embedding；target 侧需要检测和关键点。
+          两边真正汇合，是在 <code>face_swap</code>。
+        </p>
+
+        <pre><code>Source -> face_detect -> face_landmarks -> face_recognizer -> embedding --+
+                                                                          |
+                                                                          +-> face_swap -> face_restoration
+                                                                          |
+Target -> face_detect -> face_landmarks ---------------------- landmarks --+</code></pre>
+
+        <p>
+          问题在于，如果 source 和 target 共享同一个 <code>face_detect</code> 实例、
+          同一个 <code>face_landmarks</code> 实例，就算外层开了多线程，到了
+          <code>enqueueV3</code> 也会因为同一个 TensorRT context 被串行化。
+          最后的表现就是：代码看上去并发了，GPU 实际上还是一段一段跑。
+        </p>
+
+        <h2>第一步：把 source 和 target 拆开跑</h2>
+
+        <p>
+          第一层优化是最值得先做的：给 source 和 target 各自准备独立的
+          <code>face_detect</code> 与 <code>face_landmarks</code> 实例。
+          它们拥有独立 TRT context，也使用不同 CUDA stream。然后用
+          <code>std::async</code> 或同等任务调度方式把两条链路同时提交。
+        </p>
+
+        <pre><code>                +-> face_detect_src -> face_landmarks_src -> face_recognizer --+
+Source ---------+                                                              |
+                                                                               +-> face_swap -> face_restoration
+Target ---------+                                                              |
+                +-> face_detect_tgt -> face_landmarks_tgt ---------------------+</code></pre>
+
+        <p>
+          这样做的好处是边界很清楚：<code>face_recognizer</code> 只服务 source，
+          继续保留 1 份；<code>face_swap</code> 和 <code>face_restoration</code>
+          是汇合后的公共阶段，也继续保留 1 份。需要复制的只是 source / target 都会用到、
+          且当前存在 context 争用的 detect 和 landmarks。
+        </p>
+
+        <p>
+          如果 detect + landmarks 在总耗时里占比足够高，这一步有机会直接降低单次延迟。
+          文档里暂时给的预期是 30% 到 40%，但这个数字现在只能算假设：真实收益要看两个阶段在当前机器、
+          当前模型、当前输入尺寸下到底占多少。
+        </p>
+
+        <h2>为什么不是先做多线程</h2>
+
+        <p>
+          这里容易踩的坑是把“多线程调用”误认为“GPU 并行执行”。TensorRT 的 execution context
+          本身不是可以随便被多个线程同时共享的执行单元。多个 host 线程如果最终挤到同一个 context、
+          同一个默认 stream 或隐式同步点，实际执行仍然会排队。
+        </p>
+
+        <p>
+          所以这一步的关键不是写一个线程池，而是把资源所有权拆开：
+          source 链路有自己的 context 和 stream，target 链路也有自己的 context 和 stream。
+          线程只是提交任务的方式，真正决定是否能 overlap 的，是 CUDA stream、TRT context
+          和中间 buffer 是否互相独立。
+        </p>
+
+        <h2>第二步：让数据传输和推理重叠</h2>
+
+        <p>
+          source / target 并行之后，下一层才是 Host-Device 传输和 GPU 推理的 overlap。
+          原始流程通常是：
+        </p>
+
+        <pre><code>imread(host)
+-> preprocess(host)
+-> cudaMemcpy H2D
+-> inference
+-> cudaMemcpy D2H
+-> postprocess(host)</code></pre>
+
+        <p>
+          这里可以检查哪些阶段可以放到不同 stream 里交错执行。比如 source 侧在跑
+          <code>face_recognizer</code> 的时候，target 侧下一步的 H2D 数据上传是否可以已经开始。
+          如果输入来自视频流，下一帧的预处理和上传也可以提前排队。
+        </p>
+
+        <p>
+          但这一步需要更谨慎。真正的异步 H2D / D2H 通常需要 pinned memory，
+          也就是用 <code>cudaMallocHost</code> 或等价方式分配页锁定内存。
+          如果仍然用普通 pageable memory，API 表面上是 async，底层仍可能发生同步拷贝。
+        </p>
+
+        <h2>第三步：多脸场景再考虑 batching</h2>
+
+        <p>
+          如果业务场景里经常出现一张图多张脸，就可以继续把优化推进到多脸并行。
+          landmarks 和 recognizer 都很适合把多个人脸 crop 成 batch 后一次送进 TRT。
+          这样可以减少 <code>enqueue</code> 次数，也能让 GPU 更容易吃满。
+        </p>
+
+        <p>
+          这里的收益主要来自多人脸场景：理想情况下，一张图里 N 张脸的 landmarks / embedding
+          不再接近 N 倍延迟，而是更接近一个较大的 batch 延迟。视频流还可以进一步做 frame batching，
+          但这会改变延迟和吞吐之间的权衡，不一定适合所有实时换脸场景。
+        </p>
+
+        <h2>需要提前接受的成本</h2>
+
+        <p>
+          这套方案不会免费。复制 <code>face_detect</code> 和 <code>face_landmarks</code>
+          实例，意味着至少多出两份 TensorRT execution context，以及对应的 device buffer。
+          如果模型本身比较大，或者目标 GPU 显存很紧，第一步就要先做显存预算。
+        </p>
+
+        <p>
+          另一个成本是 stream 和 buffer 的生命周期管理。多 stream 并发时，默认 stream 的隐式同步、
+          同一块 host / device buffer 被两条链路复用、D2H 还没结束就进入 postprocess，
+          都会让结果变得不稳定。优化 pipeline 之前，最好先把每个模型的输入输出 buffer
+          所有权写清楚。
+        </p>
+
+        <h2>验证方式</h2>
+
+        <p>
+          现在最重要的不是继续猜，而是把 profile 打出来。至少需要把 source、target 和 common
+          阶段分开统计：
+        </p>
+
+        <pre><code>[Source] face_detect:      XX ms
+[Source] face_landmarks:   XX ms
+[Source] face_recognizer:  XX ms
+[Target] face_detect:      XX ms
+[Target] face_landmarks:   XX ms
+[Common] face_swap:        XX ms
+[Common] face_restoration: XX ms
+----------------------------------
+Total:                     XX ms</code></pre>
+
+        <p>
+          有了这个表，才能判断第一步是否值得做。如果 detect + landmarks 只占总耗时 20% 以下，
+          并行化带来的上限就比较有限，应该转去看 swap、restoration 或 CPU 后处理。
+          如果它们超过 30%，source / target 双实例并行就很值得先验证。
+        </p>
+
+        <h2>我会按这个顺序做</h2>
+
+        <p>
+          第一版先只改一件事：把 source / target 的 detect 和 landmarks 拆成双实例，
+          每条链路独立 stream，外层用 future 等两边完成后再进入 swap。
+          这一步改动最直接，也最容易通过 profile 证明有没有价值。
+        </p>
+
+        <p>
+          如果 profile 证明并行有效，再继续做 H2D / D2H overlap 和 pinned memory。
+          多脸 batching 放在最后，因为它更依赖实际业务输入：单人脸换脸不一定受益，多人脸或视频流才更值得承担复杂度。
+        </p>
+
+        <p>
+          这篇先记录思路，后面真正跑完 profile，再补一篇结果。到那时要看的不是“有没有并行”，
+          而是 GPU timeline 里空洞少了多少、端到端延迟下降多少，以及额外显存和代码复杂度是否值得。
+        </p>
+
+        <hr style="margin: 3.5rem 0 2rem; border: 0; border-top: 1px solid currentColor; opacity: 0.2;">
+
+        <h2>补几条角度（追加）</h2>
+
+        <p>
+          上面写的是主线。下面这几条偏向看了一遍 trt 实现之后想到的细节，以及文章顺序里隐含掉的优先级假设。
+          有的修正了第一步的实现路径，有的提示更大的收益可能根本不在 source / target 并行上。
+          统一放在 profile 之前的 backlog 里。
+        </p>
+
+        <h3>1. 拆链路 ≠ 复制 engine，只需要复制 context</h3>
+
+        <p>
+          第一步说“给 source 和 target 各自准备独立的 <code>face_detect</code> 与 <code>face_landmarks</code> 实例”，
+          实现的时候有个容易踩的坑：如果直接 deserialize 出两份 <code>ICudaEngine</code>，显存会多吃一倍权重。
+          但 TRT 里 <code>ICudaEngine</code> 是只读的权重容器，真正持有 workspace 和中间 buffer 的是
+          <code>IExecutionContext</code>，<code>engine-&gt;createExecutionContext()</code>
+          可以从同一个 engine 创建多个 context。
+        </p>
+
+        <p>
+          换句话说：<strong>weights 共享一份，context + stream + buffer 各开两套</strong>就够。
+          这一点要在第一版改造时就写对，否则显存预算和文章里假设的“多出两份 execution context”对不上。
+          同时也意味着拆双实例的代价比想象中小，不需要先做完显存评估才敢动。
+        </p>
+
+        <h3>2. face_restoration 可能才是真正的大头</h3>
+
+        <p>
+          文章默认把重点放在 detect / landmarks 这两个被 source / target 同时使用的模型上，
+          因为它们是 context 争用问题的来源。但经验上，整条链路里 GFPGAN / CodeFormer 这类 restoration
+          模型跑 512×512 的全 U-Net，单帧耗时往往是 detect + landmarks 之和的好几倍。
+        </p>
+
+        <p>
+          所以 profile 表打出来之前，我心里大概的排序是
+          <code>restoration &gt; swap &gt;&gt; detect ≈ landmarks ≈ recognizer</code>。
+          如果数据证实这个顺序，那并行化能拿到的天花板，可能没有把 restoration 量化到 INT8、
+          或换一个轻量 restoration 模型来得高。两件事不冲突，但优先级会被重新排。
+        </p>
+
+        <h3>3. 视频 / 多 target 场景，source 链路只需要跑一次</h3>
+
+        <p>
+          如果实际业务是“一张 source + 多帧 target / 多张 target”，
+          source 那条链路的最终产物只是一个固定的 embedding 向量。
+          只要 source 不变，detect_src、landmarks_src、recognizer 全可以在第一帧之后跳过，
+          后续帧只剩 target detect → target landmarks → swap → restoration。
+        </p>
+
+        <p>
+          对视频换脸或直播换脸，这一招的实际收益经常比并行更大，而且改起来比 stream 调度简单：
+          只要给 pipeline 类拆出 <code>set_source(image)</code> / <code>swap_to(target_image)</code>
+          两段接口，embedding 留在成员变量里。代价是接口从“一次完整调用”变成“两段调用”。
+        </p>
+
+        <h3>4. CUDA Graph 适合这种 shape 全静态的链路</h3>
+
+        <p>
+          换脸链路里 swap 和 restoration 的输入是固定 face crop（256 / 512），detect 也通常 letterbox
+          到固定分辨率。这种“shape 全静态、kernel 序列每次一样”的场景正是 CUDA Graph 的甜点：
+          用 <code>cudaStreamBeginCapture</code> 把一段 enqueueV3 + 中间 memcpy 抓成一张图，
+          之后单次 <code>cudaGraphLaunch</code> 把整段工作一次提交完，kernel launch 的 host 开销几乎归零。
+        </p>
+
+        <p>
+          在 batch=1、单卡场景下，CUDA Graph 拿到的收益经常和 source / target stream 并行同一个量级，
+          而且和 stream 并行不互斥——可以两条 stream 各自 capture 自己的 graph。
+          唯一前提是中间没有变长 shape，所以动手前要确认 detect 输出的 face crop 数量是不是被固定下来了。
+        </p>
+
+        <h3>5. CPU 上的 pre/post-process 才是更常见的 timeline 空洞</h3>
+
+        <p>
+          文章把 H2D / D2H 列为下一层 overlap 的对象，可以再补一句：
+          很多 TRT pipeline 的 GPU timeline 之所以空洞多，并不是 stream 没排好，
+          而是中间穿插了 CPU 上的 <code>cv::warpAffine</code>、色彩空间转换、NMS 这类操作。
+          face_swap 之前从 5 点 landmark 算 affine + 把人脸 warp 到对齐空间，
+          就是 prime suspect：如果它在 CPU 上跑完再传回 GPU，前后两个模型之间会硬塞进一段同步等待。
+        </p>
+
+        <p>
+          所以 pinned memory + async memcpy 是必要条件，不是充分条件。
+          要真正吃到 stream overlap，还得把链路上每一段 host 计算尽量挪到 GPU
+          （CUDA kernel 或 <code>cv::cuda</code>），剩下不可避免的 CPU 部分也要确认它和 GPU stream
+          之间没有隐式同步点。
+        </p>
+
+        <h3>6. 仓库里已经有半成品 _mt 类，先评估再写新的</h3>
+
+        <p>
+          这条偏落地：repo 里其实已经有 <code>trt_yolofacev8_mt</code> 和
+          <code>trt_face_68landmarks_mt</code>，<code>trt_facefusion_pipeline.h</code>
+          里也声明了 <code>face_detect_mt</code> / <code>face_landmarks_mt</code> 两个成员变量，
+          只是构造函数没初始化、<code>detect()</code> 里也没用，注释里写着“到时候需要更改”。
+        </p>
+
+        <p>
+          第一版改造之前先评估这两个 _mt 类的接口够不够 cover“双实例独立 stream”的需求：
+          如果够，直接接上去；如果只是“一个 worker 线程跑 detect_async”那种更轻量的封装，再考虑写新的双实例 wrapper。
+          避免推倒重写一遍 GPU 资源管理。
+        </p>
+
+        <h3>7. 验证表里再加一行 NVTX</h3>
+
+        <p>
+          文章里那张 [Source] / [Target] / [Common] 耗时表是必要的，但纯 CPU 计时区间区分不出
+          “并行”是真在 GPU 上 overlap，还是只是 host 提交得快。
+          建议在每个阶段两端加 <code>nvtxRangePush("source.detect")</code> / <code>nvtxRangePop()</code>，
+          然后用 Nsight Systems 看 timeline。
+        </p>
+
+        <p>
+          这样可以直接在 GPU 那行看到 source.detect 和 target.detect 是不是落在不同 stream 上，
+          以及它们的执行区间是真重叠还是被某个隐式同步点串成一条线。
+          数据出来之后，文章里“30% 到 40% 收益”那个假设就有了直接的证伪 / 证实路径。
+        </p>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>A quiet blog.</p>
+    </footer>
+  </body>
+</html>

@@ -6,7 +6,14 @@
     <link>https://wangzijian1010.github.io/my-blog/</link>
     <atom:link href="https://wangzijian1010.github.io/my-blog/feed.xml" rel="self" type="application/rss+xml" />
     <language>zh-CN</language>
-    <lastBuildDate>Thu, 07 May 2026 00:00:00 +0800</lastBuildDate>
+    <lastBuildDate>Fri, 08 May 2026 00:00:00 +0800</lastBuildDate>
+    <item>
+      <title>FaceFusion TensorRT 换脸管线优化设想</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/facefusion-trt-pipeline-optimization.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/facefusion-trt-pipeline-optimization.html</guid>
+      <description>一个尚未实测的 FaceFusion 换脸算法优化思路：从 source / target 链路并行、CUDA stream 到多脸 batching。</description>
+      <pubDate>Fri, 08 May 2026 00:00:00 +0800</pubDate>
+    </item>
     <item>
       <title>lite.ai.performance：TensorRT 推理管线优化</title>
       <link>https://wangzijian1010.github.io/my-blog/posts/lite-ai-performance.html</link>
