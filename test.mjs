@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { strict as assert } from "node:assert";
 
 async function fileExists(path) {
@@ -11,15 +11,22 @@ async function fileExists(path) {
 }
 
 const index = await readFile("index.html", "utf8");
+const archive = await readFile("archive.html", "utf8");
 const post = await readFile("posts/interview-loop.html", "utf8");
 const css = await readFile("styles.css", "utf8");
+const postFiles = (await readdir("posts")).filter((file) => file.endsWith(".html"));
 
 assert.match(index, /<link rel="stylesheet" href="styles\.css">/);
 assert.match(index, /<a href="index\.html"[^>]*>Home<\/a>/);
-assert.match(index, /<a href="#posts"[^>]*>Posts<\/a>/);
+assert.match(index, /<a href="archive\.html"[^>]*>Posts<\/a>/);
 assert.match(index, /<a href="#about"[^>]*>About<\/a>/);
 assert.match(index, /posts\/interview-loop\.html/);
 assert.equal(await fileExists("posts/interview-loop.html"), true);
+for (const file of postFiles) {
+  assert.match(index, new RegExp(`posts/${file}`));
+  assert.match(archive, new RegExp(`posts/${file}`));
+}
+assert.equal(/index\.html#posts/.test(index), false, "Posts nav should point to the all-posts page");
 
 assert.match(post, /<article class="post">/);
 assert.match(post, /面试不是考试/);

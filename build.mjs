@@ -168,7 +168,7 @@ ${items}
       <a class="brand" href="index.html">${SITE_TITLE}</a>
       <nav aria-label="Primary navigation">
         <a href="index.html">Home</a>
-        <a href="archive.html" aria-current="page">Archive</a>
+        <a href="archive.html" aria-current="page">Posts</a>
         <a href="index.html#about">About</a>
         <a href="feed.xml">RSS</a>
       </nav>
