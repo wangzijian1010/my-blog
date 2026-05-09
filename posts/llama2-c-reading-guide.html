@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>llama2.c 精读指引：只读这 5 段，为写 LLM TRT 模块备课 | 慢慢写</title>
+    <meta
+      name="description"
+      content="把 karpathy/llama2.c 的 700 行压缩到 1.5 小时能看完的核心部分，目的是给后面在 lite.ai.toolkit 里写 LLM TRT 推理模块备课。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="llama2.c 精读指引：只读这 5 段，为写 LLM TRT 模块备课">
+    <meta property="og:description" content="把 karpathy/llama2.c 的 700 行压缩到 1.5 小时能看完的核心部分，目的是给后面在 lite.ai.toolkit 里写 LLM TRT 推理模块备课。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/llama2-c-reading-guide.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+    <style>
+      .read-section {
+        border-left: 3px solid currentColor;
+        padding-left: 1rem;
+        margin: 1.5rem 0;
+        opacity: 0.95;
+      }
+      .read-section .meta {
+        font-size: 0.78rem;
+        opacity: 0.55;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 0.4rem;
+        font-variant-numeric: tabular-nums;
+      }
+      .skip-section {
+        opacity: 0.7;
+        border-left: 3px dashed currentColor;
+        padding-left: 1rem;
+        margin: 1.5rem 0;
+      }
+      .skip-section .meta {
+        font-size: 0.78rem;
+        opacity: 0.6;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 0.4rem;
+      }
+      ul.checklist {
+        list-style: none;
+        padding-left: 0;
+      }
+      ul.checklist li {
+        padding: 0.35rem 0;
+        line-height: 1.55;
+      }
+      ul.checklist input[type="checkbox"] {
+        margin-right: 0.55rem;
+        cursor: pointer;
+        transform: translateY(1px);
+      }
+      ul.checklist input[type="checkbox"]:checked + label {
+        opacity: 0.42;
+        text-decoration: line-through;
+      }
+      ul.checklist label {
+        cursor: pointer;
+      }
+      .self-test {
+        background: rgba(127, 127, 127, 0.06);
+        padding: 1.25rem 1.5rem;
+        border-radius: 4px;
+        margin: 1.5rem 0;
+      }
+      .self-test ol {
+        margin: 0.5rem 0 0 1.2rem;
+        padding-left: 0;
+      }
+      .self-test li {
+        padding: 0.25rem 0;
+      }
+      .reset-btn {
+        margin-top: 1.5rem;
+        font-size: 0.8rem;
+        opacity: 0.5;
+        background: none;
+        border: 1px solid currentColor;
+        padding: 0.25rem 0.7rem;
+        border-radius: 3px;
+        cursor: pointer;
+        color: inherit;
+        font-family: inherit;
+      }
+      .reset-btn:hover { opacity: 0.85; }
+      .progress {
+        font-size: 0.78rem;
+        opacity: 0.45;
+        margin-left: 0.5rem;
+        font-weight: normal;
+        font-variant-numeric: tabular-nums;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../index.html#posts">Posts</a>
+        <a href="../archive.html">Archive</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">reading guide</p>
+          <h1>llama2.c 精读指引：只读这 5 段，为写 LLM TRT 模块备课</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-09">2026.05.09</time>
+            <span>llama2.c</span>
+            <span>LLM</span>
+            <span>KV cache</span>
+            <span>Reading</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          这是
+          <a href="lite-ai-toolkit-llm-roadmap.html">给 lite.ai.toolkit 加 LLM 推理路线图</a>
+          的配套备课材料。<code>karpathy/llama2.c</code> 共 700 行 C 代码，但你不需要全读。
+          目标只有一个：读完之后能在白纸上画出 KV cache 的内存布局，
+          能解释 prefill 和 decode 阶段为什么要分开。其他都是次要的。
+          预算 1.5 小时，专注读这 5 段就够。
+        </p>
+
+        <h2>为什么是这个文件</h2>
+
+        <p>
+          市面上能完整跑通的 LLM 推理实现里，<code>karpathy/llama2.c</code> 是最适合"备课"的一个：
+        </p>
+
+        <ul>
+          <li>700 行，单文件，<strong>无任何外部依赖</strong></li>
+          <li>包含完整的 Llama 2 transformer 前向传播 + KV cache + 采样 + 生成循环</li>
+          <li>Karpathy 写的，命名清楚、不耍花招、注释合理</li>
+          <li>结构和你将来要在 TRT 里"指挥"的东西<strong>一一对应</strong>，但因为是 CPU 实现，每个细节都看得见摸得着</li>
+        </ul>
+
+        <p>
+          你不是要 port 它——TRT engine 会替你处理 90% 的矩阵运算。
+          你是要<strong>从它身上看清"那 10% 你必须自己写的胶水代码长什么样"</strong>：
+          KV cache 的布局、prefill / decode 循环、采样器、EOS 检测。
+        </p>
+
+        <h2>开始之前的准备</h2>
+
+        <ol>
+          <li><code>git clone https://github.com/karpathy/llama2.c</code></li>
+          <li>核心文件是 <code>run.c</code>，就读这一个文件</li>
+          <li>用一支笔，准备一张白纸——下面有几处需要你画</li>
+        </ol>
+
+        <h2>读完这一篇你应该能做的 4 件事</h2>
+
+        <p>这是判断"读到位了没"的标准。读之前先记住：</p>
+
+        <ol>
+          <li>能在白纸上画出 KV cache 在内存里的布局，标出 layer / seq position / head / dim 四个维度</li>
+          <li>能用一句话解释为什么 prefill 阶段输入是整段 prompt、decode 阶段每次只输入一个 token</li>
+          <li>能指出在每一步 decode 里，哪些张量是"要复用前面计算结果的"、哪些是"每步重新算的"</li>
+          <li>能说出从 logits 到下一个 token id 的完整采样流程（temperature → softmax → top-p → sample）</li>
+        </ol>
+
+        <h2 data-phase="must">必读的 5 段（按顺序读） <span class="progress" data-progress-for="must"></span></h2>
+
+        <div class="read-section">
+          <p class="meta">Section 1 · 15 min · search: <code>typedef struct</code></p>
+          <h3>1. Config 和 TransformerWeights 这两个 struct</h3>
+          <p>
+            从文件开头开始，找到 <code>Config</code> 和 <code>TransformerWeights</code> 这两个 struct 定义。
+            这是整个模型在内存里的"零件清单"。
+          </p>
+          <p><strong>要看的</strong>：</p>
+          <ul>
+            <li><code>Config</code> 里的 <code>dim</code>、<code>hidden_dim</code>、<code>n_layers</code>、<code>n_heads</code>、<code>n_kv_heads</code>、<code>vocab_size</code>、<code>seq_len</code> 各是什么意思（在你旁边标注一下）</li>
+            <li><code>TransformerWeights</code> 里每一项都是哪一层的哪一种权重——例如 <code>wq</code> 是 query 投影矩阵，<code>w1/w2/w3</code> 是 FFN 三个矩阵</li>
+          </ul>
+          <p><strong>动作</strong>：在白纸上把 transformer 一层的零件画出来：embed → norm → q/k/v 投影 → attention → o 投影 → norm → FFN(w1, w2, w3) → 残差。这张图就是后面 <code>forward()</code> 函数的执行流程。</p>
+        </div>
+
+        <div class="read-section">
+          <p class="meta">Section 2 · 15 min · search: <code>RunState</code></p>
+          <h3>2. RunState struct，重点看 key_cache 和 value_cache 字段</h3>
+          <p>
+            <code>RunState</code> 是推理时的"工作台"，所有中间张量都在这。
+            你只需要专注两个字段：<code>key_cache</code> 和 <code>value_cache</code>。
+          </p>
+          <p><strong>要看的</strong>：</p>
+          <ul>
+            <li>这两个字段的类型（一维 float 数组）和分配尺寸（<code>n_layers * seq_len * kv_dim</code> 一类的乘积）</li>
+            <li>那些 <code>n_layers</code>、<code>seq_len</code>、<code>kv_dim</code> 是怎么算出来的</li>
+          </ul>
+          <p><strong>动作</strong>：在白纸上画一个三维的盒子——长 = layer 数，宽 = seq position，深 = kv_dim 大小。这个盒子就是 KV cache。等会儿在 <code>forward()</code> 里你会看到代码怎么往这个盒子里写、怎么从里面读。</p>
+          <p><strong>关键认知</strong>：这块内存在 CPU 上是一个普通 <code>malloc</code>，在你将来的 TRT 版里会变成一块 <code>cudaMalloc</code> 出来的 device memory。布局可以一模一样。</p>
+        </div>
+
+        <div class="read-section">
+          <p class="meta">Section 3 · 30 min · search: <code>void forward</code></p>
+          <h3>3. forward() 函数 —— 整个 transformer 的一次前向</h3>
+          <p>
+            这是最长最密集的一段，也是最有价值的一段。<strong>不要逐行追细节</strong>，
+            按下面的顺序扫描，确认每一步在做什么。
+          </p>
+          <p><strong>扫描顺序</strong>（每一步 1-2 分钟）：</p>
+          <ol>
+            <li>token embedding 查表 —— <code>x = w-&gt;token_embedding_table[token]</code> 风格的代码</li>
+            <li>进入 layer 循环 <code>for (int l = 0; l &lt; p-&gt;n_layers; l++)</code></li>
+            <li>第一个 RMSNorm（<code>rmsnorm</code> 调用）</li>
+            <li>QKV 投影（三次 <code>matmul</code>），把 x 变成 q、k、v</li>
+            <li>RoPE 旋转位置编码（对 q 和 k 做）</li>
+            <li><strong>关键：把 k 和 v 写进 key_cache 和 value_cache 的当前位置</strong>—— 找到那行赋值，看它是怎么用 <code>l</code>（layer）和 <code>pos</code>（当前 token 位置）算偏移的</li>
+            <li>注意力计算：q 和 <strong>整段 cache 里的 K</strong> 做点积 → softmax → 乘 <strong>整段 cache 里的 V</strong> → 输出</li>
+            <li>O 投影 + 残差</li>
+            <li>第二个 RMSNorm + FFN（SwiGLU：w1 和 w3 算 gate，w2 投影回去）+ 残差</li>
+            <li>循环结束，最后 RMSNorm + classifier 投影到 logits（<code>vocab_size</code> 维）</li>
+          </ol>
+          <p><strong>要重点理解的一点</strong>：第 6 步把当前 token 的 K/V 写进 cache 之后，第 7 步的 attention 是用<strong>当前 q</strong>和<strong>cache 里 0 到 pos 的所有 K/V</strong>做的。这就是为什么 cache 必须存——下一步生成下一个 token 时，前面这些 K/V 都还要用。</p>
+          <p><strong>动作</strong>：在你刚才画的 KV cache 盒子上，标出"当前这一步在第 <code>l</code> 层、第 <code>pos</code> 列写入数据"，然后画一个箭头表示"attention 时读 0 到 pos 这一段"。</p>
+        </div>
+
+        <div class="read-section">
+          <p class="meta">Section 4 · 15 min · search: <code>void generate</code></p>
+          <h3>4. generate() 函数 —— autoregressive 循环</h3>
+          <p>这一段是你将来在 <code>TRTQwen2::generate()</code> 里要复制的"骨架"。</p>
+          <p><strong>要看的</strong>：</p>
+          <ul>
+            <li>外层循环结构：<code>while (pos &lt; steps)</code> 之类</li>
+            <li>每次循环里依次做了什么：调 <code>forward(token, pos)</code> → 拿到 <code>state.logits</code> → 调 <code>sample()</code> 拿下一个 token → 打印或保存 → <code>pos++</code></li>
+            <li>对 prompt 部分的特殊处理：<strong>prompt token 不用采样，直接把 prompt 里下一个 token 喂进去</strong>；只有当 <code>pos</code> 超过 prompt 长度后，才真正开始用 sampler 选 token</li>
+            <li>EOS 终止：哪个 token id 触发跳出循环</li>
+          </ul>
+          <p><strong>关键认知</strong>：llama2.c 的 <code>generate</code> 里其实没有显式的 "prefill 阶段"——它是一个 token 一个 token 喂进去的，prompt 也走同样的 forward。<strong>但 TRT 版会显式拆成 prefill + decode 两个 context</strong>：prefill 一次性吃整段 prompt（更高效），decode 每次只吃一个 token。这是 llama2.c 和你将来代码的最大结构差异。</p>
+        </div>
+
+        <div class="read-section">
+          <p class="meta">Section 5 · 15 min · search: <code>int sample</code></p>
+          <h3>5. sample() 函数 —— 从 logits 到下一个 token</h3>
+          <p>
+            采样器是个独立小模块，llama2.c 里实现得很干净。这一段是你将来 <code>Sampler</code> 类的"参考实现"。
+          </p>
+          <p><strong>要看的</strong>：</p>
+          <ul>
+            <li>greedy（argmax）路径：当 temperature 为 0 时直接返回 logits 最大的位置</li>
+            <li>temperature scaling：<code>logits[i] /= temperature</code> 然后过 softmax 变成概率</li>
+            <li>top-p（nucleus sampling）：把概率从大到小排，累加到超过 p 为止，只在这部分里采样</li>
+            <li>多项式采样：从概率分布里抽一个</li>
+          </ul>
+          <p><strong>关键认知</strong>：这一整段都是<strong>纯 CPU 操作</strong>，不依赖 GPU。你将来在 toolkit 里第一版 Sampler 也可以纯 CPU——把 logits 从 device 拷回 host 再采样。后期再写 CUDA kernel 上 GPU 是独立优化（一篇博客）。</p>
+        </div>
+
+        <h2 data-phase="skim">这 3 段可以扫一眼跳过 <span class="progress" data-progress-for="skim"></span></h2>
+
+        <div class="skip-section">
+          <p class="meta">Skim · 5 min total</p>
+          <h3>1. matmul / rmsnorm / softmax 的实现细节</h3>
+          <p>知道它们做什么就够了，不用追每一行。在你将来的 TRT 版里，这些算子全部封装在 ONNX 模型 / TRT engine 里，你不需要自己写。</p>
+        </div>
+
+        <div class="skip-section">
+          <p class="meta">Skim · 5 min total</p>
+          <h3>2. BPE tokenizer（<code>bpe_encode</code> 等函数）</h3>
+          <p>llama2.c 用的是 Llama 的 SentencePiece tokenizer，和你将来要支持的 Qwen2 GPT2-style BPE 完全是不同的算法。这段算法层面没必要深读——你的 tokenizer 会单独写一份。</p>
+        </div>
+
+        <div class="skip-section">
+          <p class="meta">Skim · 5 min total</p>
+          <h3>3. 模型加载（mmap、文件读取）</h3>
+          <p>llama2.c 的 <code>.bin</code> 格式是 Karpathy 自己定的，TRT 加载的是 <code>.engine</code> 二进制。两者完全无关。这部分代码看一眼知道"哦，是个内存映射读权重"就够了。</p>
+        </div>
+
+        <div class="self-test">
+          <h2 style="margin-top: 0;">自测：读完之后回答这 8 个问题</h2>
+          <p>不用打字回答，心里默答或在笔记本上写一行就行。<strong>能答对 6 题，备课就到位了</strong>。</p>
+          <ol>
+            <li>KV cache 的总大小怎么算？给出公式，单位是字节。</li>
+            <li>第 <code>l</code> 层、第 <code>pos</code> 个 token 的 K 在 <code>key_cache</code> 数组里的偏移是多少？</li>
+            <li>每一步 forward 里，哪些张量需要"读取 cache 里所有历史位置"？</li>
+            <li>RoPE 是在 K/V 写入 cache 之前还是之后做的？为什么这个顺序很关键？</li>
+            <li>从 logits（一个 vocab_size 维向量）到下一个 token id，中间经过哪几步操作？</li>
+            <li>generate 里 prompt 的处理和后续生成的处理，区别在什么地方？</li>
+            <li>如果你要把 llama2.c 的 forward 改成"一次吃 N 个 token"（也就是 prefill 模式），要改哪几处？</li>
+            <li>EOS token 是在哪个环节判断的？如果模型一直不输出 EOS，循环会怎么停下来？</li>
+          </ol>
+          <p style="margin-bottom: 0;"><strong>判分标准</strong>：第 1、2、3、6 题答不上来 → 必读 5 段没看到位，回头再扫；第 4、5、7、8 题答不上来 → 没关系，工程性的细节，写代码时自然会清楚。</p>
+        </div>
+
+        <h2>读完之后，把 llama2.c 的概念翻译到你的 TRT 版</h2>
+
+        <p>这是这次精读的真正用途。下面这张表请收好，等你开始写 PR2 的 <code>KVCacheBuffer</code> 时再回来看一次。</p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>llama2.c 里的东西</th>
+              <th>在你 TRT 版里对应什么</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>TransformerWeights</code> struct</td>
+              <td>消失——所有权重打包在 <code>.engine</code> 文件里，你不直接持有</td>
+            </tr>
+            <tr>
+              <td><code>RunState</code> 里的 <code>x</code>、<code>q</code>、<code>k</code>、<code>v</code>、<code>logits</code> 等中间张量</td>
+              <td>消失——TRT engine 内部分配，你不需要管</td>
+            </tr>
+            <tr>
+              <td><code>RunState</code> 里的 <code>key_cache</code> + <code>value_cache</code></td>
+              <td><strong>变成你的 <code>KVCacheBuffer</code>，必须自己管理（device memory，跨调用持久化）</strong></td>
+            </tr>
+            <tr>
+              <td><code>matmul</code>、<code>rmsnorm</code>、RoPE、SwiGLU 这些算子</td>
+              <td>消失——TRT engine 替你跑</td>
+            </tr>
+            <tr>
+              <td><code>forward()</code> 函数的算子序列</td>
+              <td>消失——一次 <code>enqueueV3</code> 替代</td>
+            </tr>
+            <tr>
+              <td><code>forward(token, pos)</code> 的循环调用</td>
+              <td><strong>变成你的 decode loop：每次调 <code>decode_context-&gt;enqueueV3</code>，配合 KV cache 的 slot 切换</strong></td>
+            </tr>
+            <tr>
+              <td>prompt 阶段的逐 token forward</td>
+              <td><strong>变成 prefill_context：一次性把整段 prompt 喂进去（高效得多）</strong></td>
+            </tr>
+            <tr>
+              <td><code>sample()</code> 函数</td>
+              <td><strong>变成你的 <code>Sampler</code> 类，第一版直接照抄 llama2.c 的算法（CPU 实现）</strong></td>
+            </tr>
+            <tr>
+              <td>BPE tokenizer</td>
+              <td>消失——你写自己的 GPT2-style BPE，从 <code>vocab.json</code> + <code>merges.txt</code> 加载</td>
+            </tr>
+            <tr>
+              <td>EOS 判断 + max_steps 截断</td>
+              <td>原样保留，写在 decode loop 里</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p>
+          看清楚了吗——
+          <strong>llama2.c 的 700 行里，只有"加粗"那 4 行是你要在 toolkit 里重新实现的</strong>。
+          这 4 行就是你的 PR2 + PR3 的全部业务代码。其他都被 TRT 替换掉，或者由 tokenizer 子模块独立处理。
+        </p>
+
+        <h2>读完打勾</h2>
+
+        <ul class="checklist" data-phase-group="checklist">
+          <li><input type="checkbox" id="r-1"><label for="r-1">读完 Section 1：Config 和 TransformerWeights，画了一层 transformer 零件图</label></li>
+          <li><input type="checkbox" id="r-2"><label for="r-2">读完 Section 2：RunState 的 key_cache / value_cache，画了三维盒子</label></li>
+          <li><input type="checkbox" id="r-3"><label for="r-3">读完 Section 3：forward() 的 10 步扫描，标出了"写入 cache"和"读 cache"的位置</label></li>
+          <li><input type="checkbox" id="r-4"><label for="r-4">读完 Section 4：generate() 的循环结构，理解了 prompt 处理和生成的区别</label></li>
+          <li><input type="checkbox" id="r-5"><label for="r-5">读完 Section 5：sample() 的采样流程</label></li>
+          <li><input type="checkbox" id="r-6"><label for="r-6">扫完那 3 段 skip 部分</label></li>
+          <li><input type="checkbox" id="r-7"><label for="r-7">自测 8 题至少答对 6 题</label></li>
+          <li><input type="checkbox" id="r-8"><label for="r-8">在 <a href="lite-ai-toolkit-llm-roadmap.html">路线图</a>里勾掉对应的探针项</label></li>
+        </ul>
+
+        <button class="reset-btn" id="reset-todo">重置勾选</button>
+
+        <script>
+          (function () {
+            var STORAGE_KEY = 'llama2c-reading-v1';
+            var state = {};
+            try { state = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
+            catch (e) { state = {}; }
+
+            var checkboxes = document.querySelectorAll('ul.checklist input[type="checkbox"]:not([disabled])');
+            checkboxes.forEach(function (cb) {
+              if (state[cb.id]) cb.checked = true;
+              cb.addEventListener('change', function () {
+                state[cb.id] = cb.checked;
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+                updateProgress();
+              });
+            });
+
+            function updateProgress() {
+              document.querySelectorAll('[data-progress-for]').forEach(function (span) {
+                var key = span.dataset.progressFor;
+                var done = 0, total = 0;
+                if (key === 'must') { done = 5; total = 5;
+                  ['r-1','r-2','r-3','r-4','r-5'].forEach(function (id) {
+                    if (!document.getElementById(id) || !document.getElementById(id).checked) done--;
+                  });
+                  done = Math.max(0, done + 0); // dummy to keep linter calm
+                  done = ['r-1','r-2','r-3','r-4','r-5'].filter(function(id){
+                    var el = document.getElementById(id); return el && el.checked;
+                  }).length;
+                }
+                if (key === 'skim') {
+                  total = 1;
+                  done = (document.getElementById('r-6') && document.getElementById('r-6').checked) ? 1 : 0;
+                }
+                if (total > 0) span.textContent = done + ' / ' + total;
+              });
+            }
+
+            updateProgress();
+
+            var resetBtn = document.getElementById('reset-todo');
+            if (resetBtn) {
+              resetBtn.addEventListener('click', function () {
+                if (!confirm('确定清掉所有勾选吗？')) return;
+                localStorage.removeItem(STORAGE_KEY);
+                checkboxes.forEach(function (cb) { cb.checked = false; });
+                updateProgress();
+              });
+            }
+          })();
+        </script>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>A quiet blog.</p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,1011 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>啃完 llama2.c：从 ONNX 部署到自己写一个 LLM 推理引擎 | 慢慢写</title>
+    <meta
+      name="description"
+      content="700 行 C 跑通 Llama 2 推理。给从 CV/ONNX 转过来、第一次看 Transformer 推理代码的人。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="啃完 llama2.c：从 ONNX 部署到自己写一个 LLM 推理引擎">
+    <meta property="og:description" content="700 行 C 跑通 Llama 2 推理。给从 CV/ONNX 转过来、第一次看 Transformer 推理代码的人。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/llama2-c-walkthrough.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../archive.html">Posts</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">llm inference note</p>
+          <h1>啃完 llama2.c：从 ONNX 部署到自己写一个 LLM 推理引擎</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-09">2026.05.09</time>
+            <span>LLM</span>
+            <span>推理</span>
+            <span>C</span>
+            <span>Transformer</span>
+            <span>学习笔记</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          如果你和我一样，过去一直在做 CV 小模型的部署——拿 ONNX、上 TensorRT、写写 plugin、调调 INT8——但是从来没有真正打开过一个 LLM 推理引擎的代码，那这篇文章就是给你写的。
+        </p>
+
+        <p>
+          <a href="https://github.com/karpathy/llama2.c">karpathy/llama2.c</a>
+          是 Andrej Karpathy 用大约 700 行 C 写的 Llama 2 推理引擎。它的好处是：
+        </p>
+
+        <ul>
+          <li><strong>零依赖</strong>：只靠 <code>libc</code> 和 <code>libm</code>，一个 <code>gcc -O3 -o run run.c -lm</code> 就能跑。</li>
+          <li><strong>完整可读</strong>：核心逻辑全在一个 <code>run.c</code> 里，没有任何抽象层、模板、宏地狱。</li>
+          <li><strong>架构是真的</strong>：不是一个玩具，跑出来的 token 和 PyTorch 完全一致（仓库里的 <code>test_all.py</code> 就是用 200 步逐 token 对齐测的）。</li>
+        </ul>
+
+        <p>
+          读懂它之后，你会建立起对 LLM 推理的一个非常清晰的"机械"理解，再去看
+          <code>llama.cpp</code>、<code>vLLM</code>、<code>TensorRT-LLM</code> 就有了一个最朴素的参照系。
+        </p>
+
+        <p>我会假设你：</p>
+        <ul>
+          <li>写过 C/C++、知道 <code>mmap</code>、知道指针运算。</li>
+          <li>部署过 ONNX，懂"算子"、"权重"、"推理图"这些概念。</li>
+          <li><strong>不熟 Transformer 内部结构</strong>，没看过 attention 公式细节也没关系——这篇会从零讲起。</li>
+        </ul>
+
+        <h2>1. 先建立大局观</h2>
+
+        <p>我们先不看代码，只看流程。一次推理在做什么：</p>
+
+        <pre><code>用户输入文本: "Once upon a time"
+        │
+        ▼
+   [ Tokenizer ]   把字符串切成整数 ID 列表，比如 [1, 9038, 2501, 263, 931]
+        │
+        ▼
+   [ Transformer ]  对每个位置算出"下一个最可能的 token 是谁"
+        │           ── 这一步要做 N 层 (Llama 7B 有 32 层)
+        │              每层都包含：Attention + FFN
+        ▼
+   [ Sampler ]     从概率分布里抽一个 token 出来 (greedy / top-p / temperature)
+        │
+        ▼
+   把这个新 token 拼回输入末尾，回到第二步，继续算下一个。</code></pre>
+
+        <p>
+          整个 LLM 推理就是一个<strong>循环</strong>：每一轮吃一个 token、吐一个 token，
+          直到达到 max_steps 或者吐出 EOS。
+        </p>
+
+        <p>对应到 llama2.c 的源码，这三块就是：</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>模块</th>
+                <th>文件位置</th>
+                <th>对应 ONNX 部署里的什么</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Transformer 前向</td>
+                <td><code>run.c</code> 中的 <code>forward()</code></td>
+                <td>TensorRT engine 的 <code>enqueue()</code></td>
+              </tr>
+              <tr>
+                <td>Tokenizer</td>
+                <td><code>run.c</code> 中的 <code>encode()</code> / <code>decode()</code></td>
+                <td>通常是预处理，CV 里没有对应物</td>
+              </tr>
+              <tr>
+                <td>Sampler</td>
+                <td><code>run.c</code> 中的 <code>sample()</code></td>
+                <td>后处理（NMS 之类的对应物）</td>
+              </tr>
+              <tr>
+                <td>权重格式</td>
+                <td><code>model.bin</code></td>
+                <td><code>.onnx</code> / <code>.engine</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>2. 权重格式：.bin 文件长什么样</h2>
+
+        <p>
+          ONNX 文件里，权重是按算子名挂在 graph node 上的；llama2.c 走了一条<strong>极端朴素</strong>的路：
+          把所有权重按一个固定顺序、紧挨着、以 fp32 写到一个二进制文件里。
+          没有 metadata、没有 tag、没有 index——完全靠"读的人和写的人约定好顺序"。
+        </p>
+
+        <p>文件头是一个 28 字节的 <code>Config</code>：</p>
+
+        <pre><code>typedef struct {
+    int dim;         // 隐藏维度，比如 4096 (7B 模型)
+    int hidden_dim;  // FFN 内部的中间维度
+    int n_layers;    // Transformer 层数 (7B = 32)
+    int n_heads;     // 注意力头数
+    int n_kv_heads;  // K/V 头数 (可以 &lt; n_heads, 这就是 GQA)
+    int vocab_size;  // 词表大小，Llama 2 是 32000
+    int seq_len;     // 最大序列长度
+} Config;</code></pre>
+
+        <blockquote>
+          <strong>彩蛋小坑</strong>：<code>vocab_size</code> 居然用正负号偷偷编码了一个布尔位——
+          正数表示输出层和 embedding 层共享权重（weight tying），负数表示不共享。
+          这种 hacky 的做法在 <code>read_checkpoint()</code> 里能看到 <code>abs()</code> 操作。
+          原作者自己也吐槽 "bit yikes"。
+        </blockquote>
+
+        <p>文件头之后，就是一连串的 fp32 数组，按这个顺序排列：</p>
+
+        <pre><code>[ Config 头 28 字节 ]
+[ token_embedding_table:   vocab_size × dim ]
+[ rms_att_weight:          n_layers × dim    ]   每层 attention 前的 RMSNorm 缩放因子
+[ wq:  n_layers × dim × (n_heads × head_size)    ]   Q 投影
+[ wk:  n_layers × dim × (n_kv_heads × head_size) ]   K 投影 (注意是 kv_heads)
+[ wv:  n_layers × dim × (n_kv_heads × head_size) ]   V 投影
+[ wo:  n_layers × (n_heads × head_size) × dim    ]   输出投影
+[ rms_ffn_weight:          n_layers × dim    ]   FFN 前的 RMSNorm
+[ w1, w2, w3:              n_layers × dim × hidden_dim 三块 ]   FFN 三个矩阵
+[ rms_final_weight:        dim ]
+[ (跳过 seq_len × head_size 个 fp32 — 旧版本残留的 RoPE 频率表) ]
+[ wcls (可选): vocab_size × dim ]   如果不共享 embedding 才有</code></pre>
+
+        <p>
+          这就是为什么在 <code>run.c</code> 的 <code>memory_map_weights()</code> 里你会看到一长串
+          <code>ptr += ...; ptr += ...;</code>——它是按上面这个顺序，把一个大数组切成几十个子数组的指针：
+        </p>
+
+        <pre><code>w-&gt;token_embedding_table = ptr;
+ptr += p-&gt;vocab_size * p-&gt;dim;
+w-&gt;rms_att_weight = ptr;
+ptr += n_layers * p-&gt;dim;
+w-&gt;wq = ptr;
+ptr += n_layers * p-&gt;dim * (p-&gt;n_heads * head_size);
+// ... 一直这样切下去</code></pre>
+
+        <p>
+          类比 ONNX：你可以把这个 <code>.bin</code> 想成一个<strong>没有 graph、只有 raw weights initializer 段、
+          并且写死了 layout 顺序的极简 ONNX</strong>。
+        </p>
+
+        <h2>3. 怎么把模型"加载"进内存：mmap</h2>
+
+        <p>这一步是我个人觉得 llama2.c 最巧妙的地方之一。</p>
+
+        <p>
+          普通做法：<code>fopen → fread → 把整个文件读到 malloc 出来的 buffer 里</code>。
+          7B 模型 26GB，这意味着你要 malloc 26GB、再 read 26GB。
+        </p>
+
+        <p>llama2.c 用的是 <code>mmap</code>：</p>
+
+        <pre><code>*data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);</code></pre>
+
+        <p>
+          <code>mmap</code> 把文件<strong>直接映射成一段虚拟内存</strong>。
+          OS 负责按页（4KB）lazy load——你访问哪一页，它才从磁盘读哪一页。好处：
+        </p>
+
+        <ol>
+          <li><strong>零拷贝</strong>：内核 page cache 里的数据直接被映射到你的进程地址空间。</li>
+          <li><strong>多进程共享</strong>：你启 4 个 <code>./run</code> 进程，OS 只在物理内存里放一份权重。</li>
+          <li><strong>启动飞快</strong>：<code>mmap</code> 调用本身只是建个映射表，毫秒级返回。</li>
+        </ol>
+
+        <p>
+          代价是：第一次访问每一页时会有缺页中断的延迟。
+          在 LLM 这种"每个权重都要读一遍"的场景下，这个延迟均摊到第一次 forward 上。
+        </p>
+
+        <blockquote>
+          对照：TensorRT engine 文件你也是 <code>IRuntime-&gt;deserializeCudaEngine()</code>
+          一次性加载到 GPU 显存。<code>mmap</code> 是 CPU 推理才用得上的技巧——
+          GPU 推理你逃不掉显存拷贝。
+        </blockquote>
+
+        <p>
+          加载完之后，<code>TransformerWeights</code> 结构体里的每一个指针，
+          都指向 <code>mmap</code> 出来的同一块大内存的不同偏移：
+        </p>
+
+        <pre><code>mmap 出来的虚拟内存:
+┌─────────────┬──────────────┬─────────┬─────────┬────────┐
+│ token_embed │ rms_att      │ wq      │ wk      │ ...    │
+└─────────────┴──────────────┴─────────┴─────────┴────────┘
+       ▲             ▲              ▲          ▲
+       │             │              │          │
+   token_embedding   rms_att_weight wq         wk</code></pre>
+
+        <h2>4. Transformer 是什么：5 分钟速通</h2>
+
+        <p>
+          如果你没看过 Transformer，下面这张图是核心。
+          一个 Transformer 由 N 个<strong>完全一样</strong>的 Block 串起来：
+        </p>
+
+        <pre><code>                    输入: 一串 token id
+                          │
+                          ▼
+              ┌─────────────────────┐
+              │ Token Embedding     │  把每个 id 查表变成一个 dim 维向量
+              └─────────────────────┘
+                          │
+                          ▼
+        ┌──────────────────────────────────┐
+        │  Block × N (Llama 7B 是 N=32)    │
+        │                                   │
+        │   x ─┬─ RMSNorm ─ Attention ─┐   │
+        │     │                        +    │  ← 残差连接
+        │     └────────────────────────┘   │
+        │                │                  │
+        │     ┌──────────┴────────────┐    │
+        │     │                       │    │
+        │     ├─ RMSNorm ─ FFN ───────┤    │
+        │     +                       │    │
+        │     └───────────────────────┘    │
+        │                │                  │
+        └────────────────┼──────────────────┘
+                          ▼
+                       RMSNorm
+                          │
+                          ▼
+                      Linear (classifier)
+                          │
+                          ▼
+                logits: vocab_size 维向量
+                每个值 = "这个位置是某 token 的得分"</code></pre>
+
+        <p>每个 Block 做两件事：</p>
+
+        <ul>
+          <li><strong>Attention</strong>：让序列里每个位置去"看"前面所有位置，把它们的信息按相关度聚合过来。</li>
+          <li><strong>FFN (Feed-Forward Network)</strong>：一个两层 MLP，对每个位置独立做一次非线性变换。</li>
+        </ul>
+
+        <p>围绕这两块，Llama 用的"小组件"是：</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>组件</th>
+                <th>作用</th>
+                <th>你之前可能熟悉的对应物</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>RMSNorm</td>
+                <td>归一化</td>
+                <td>LayerNorm 的简化版</td>
+              </tr>
+              <tr>
+                <td>RoPE</td>
+                <td>给 Q/K 注入位置信息</td>
+                <td>老 Transformer 里的 sin/cos position encoding</td>
+              </tr>
+              <tr>
+                <td>GQA</td>
+                <td>K/V 头数 &lt; Q 头数，省 KV cache</td>
+                <td>普通 multi-head attention</td>
+              </tr>
+              <tr>
+                <td>SwiGLU</td>
+                <td>FFN 的非线性</td>
+                <td>ReLU/GELU</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>下一节我们逐个讲这些是什么，并且对着 <code>forward()</code> 的源码走一遍。</p>
+
+        <h2>5. 跟着 forward() 走一遍</h2>
+
+        <p>
+          <code>run.c</code> 的 <code>forward(transformer, token, pos)</code> 是整个引擎的心脏。
+          它的输入是：
+        </p>
+
+        <ul>
+          <li><code>token</code>：当前要喂进去的那一个 token ID（<strong>只有一个！</strong>后面会解释为什么）。</li>
+          <li><code>pos</code>：当前 token 在整个序列里的位置（0, 1, 2, ...）。</li>
+        </ul>
+
+        <p>它的输出是：<code>logits[vocab_size]</code>，告诉你下一个位置每个 token 的得分。</p>
+
+        <p>
+          这里的关键观察是：<strong>LLM 推理是一个 token 一个 token 算的，不是一次把整个序列丢进去</strong>。
+          这个跟训练完全不同，原因下面讲 KV cache 时会说。
+        </p>
+
+        <h3>5.1 第一步：查 embedding</h3>
+
+        <pre><code>float* content_row = w-&gt;token_embedding_table + token * dim;
+memcpy(x, content_row, dim*sizeof(*x));</code></pre>
+
+        <p>
+          <code>token_embedding_table</code> 是个 <code>[vocab_size, dim]</code> 的大矩阵。
+          第 <code>token</code> 行就是这个 token 对应的初始向量。
+          直接 memcpy 到工作 buffer <code>x</code> 里，结束。
+        </p>
+
+        <p>类比 ONNX：这就是一个 <code>Gather</code> 算子。</p>
+
+        <h3>5.2 第二步：进入每一层 Block 的循环</h3>
+
+        <pre><code>for (unsigned long long l = 0; l &lt; p-&gt;n_layers; l++) {
+    // ... attention + ffn ...
+}</code></pre>
+
+        <p>下面所有内容都在这个循环里，对每一层 <code>l</code> 都做一次。</p>
+
+        <h3>5.3 RMSNorm：比 LayerNorm 更简单的归一化</h3>
+
+        <pre><code>void rmsnorm(float* o, float* x, float* weight, int size) {
+    float ss = 0.0f;
+    for (int j = 0; j &lt; size; j++) ss += x[j] * x[j];
+    ss /= size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    for (int j = 0; j &lt; size; j++) o[j] = weight[j] * (ss * x[j]);
+}</code></pre>
+
+        <p>公式：</p>
+
+        <pre><code>RMSNorm(x) = x / sqrt(mean(x²) + eps) * weight</code></pre>
+
+        <p>
+          和 LayerNorm 的差别：LayerNorm 要先减均值，再除以标准差，还有 bias；
+          RMSNorm <strong>不减均值、没有 bias</strong>，只用 RMS（root mean square）做缩放。
+          少几次运算，效果差不多——所以 Llama 选了它。
+        </p>
+
+        <h3>5.4 QKV 投影：把 x 打成查询/键/值</h3>
+
+        <pre><code>matmul(s-&gt;q, s-&gt;xb, w-&gt;wq + l*dim*dim,    dim, dim);
+matmul(s-&gt;k, s-&gt;xb, w-&gt;wk + l*dim*kv_dim, dim, kv_dim);
+matmul(s-&gt;v, s-&gt;xb, w-&gt;wv + l*dim*kv_dim, dim, kv_dim);</code></pre>
+
+        <p>
+          注意 <code>s-&gt;k</code> 和 <code>s-&gt;v</code> 这两行其实<strong>直接写进了 KV cache</strong>，
+          不是写进临时 buffer：
+        </p>
+
+        <pre><code>int loff = l * p-&gt;seq_len * kv_dim;          // 第 l 层的起始偏移
+s-&gt;k = s-&gt;key_cache   + loff + pos * kv_dim; // 当前位置的 K
+s-&gt;v = s-&gt;value_cache + loff + pos * kv_dim; // 当前位置的 V</code></pre>
+
+        <p>
+          <code>key_cache</code> 和 <code>value_cache</code> 是两个超大的 buffer，
+          提前在 <code>malloc_run_state()</code> 里 calloc 好：
+        </p>
+
+        <pre><code>key_cache shape: [n_layers, seq_len, kv_dim]</code></pre>
+
+        <p>也就是说，<strong>每一层、每一个位置的 K 和 V 都被永久存着</strong>。这就是 KV cache。</p>
+
+        <h4>为什么需要 KV cache？</h4>
+
+        <p>
+          回想一下 attention 公式：第 <code>pos</code> 个位置的 token 要和位置 <code>0..pos</code>
+          所有 token 的 K/V 做交互。
+        </p>
+
+        <p>
+          如果没有 cache，每生成一个新 token，你都得把前面所有 token 重新过一遍 QKV 投影。
+          生成第 100 个 token 时，前 99 个的 K/V 你就重算了 99 次。
+        </p>
+
+        <p>
+          KV cache 的洞察非常简单：<strong>前面那些 token 的 K/V 算完之后再也不会变，存起来就行</strong>。
+        </p>
+
+        <p>
+          所以 LLM 推理实际上只对<strong>当前位置</strong>做 QKV 投影，K 和 V 顺手存进 cache，
+          而 Q 拿来跟 cache 里所有历史 K 做注意力。
+          这就是为什么 <code>forward()</code> 一次只接收一个 token 的原因。
+        </p>
+
+        <blockquote>
+          这是 prefill 和 decode 两个阶段的差别——prefill 是处理 prompt（一次性大批量算），
+          decode 是逐 token 生成（每步只算一个）。llama2.c 的 <code>forward()</code>
+          把它们统一成了"一次一个 token"，所以 prefill 的吞吐其实没优化到极致；
+          vLLM 之类生产引擎会专门加速 prefill。
+        </blockquote>
+
+        <h4>GQA：为什么 K 和 V 是 kv_dim，Q 是 dim？</h4>
+
+        <pre><code>int kv_dim = (p-&gt;dim * p-&gt;n_kv_heads) / p-&gt;n_heads;
+int kv_mul = p-&gt;n_heads / p-&gt;n_kv_heads;  // KV 共享因子</code></pre>
+
+        <p>
+          普通 multi-head attention 里 <code>n_kv_heads == n_heads</code>，
+          每个查询头都有自己专属的 K/V 头。但 Llama 2 里 K/V 头数可以<strong>少于</strong> Q 头数——
+          多个 Q 头共享同一组 K/V，这就是 GQA (Grouped Query Attention)。
+        </p>
+
+        <p>
+          好处：KV cache 缩小一倍/几倍。
+          Llama 2 70B 用 GQA 把 KV cache 从原本不可承受变成了可以接受的大小。
+        </p>
+
+        <p>
+          <code>kv_mul</code> 就是"每个 KV 头被几个 Q 头共享"。
+          后面 attention 循环里，Q 头 <code>h</code> 对应的 KV 头是 <code>h / kv_mul</code>。
+        </p>
+
+        <h3>5.5 RoPE：旋转位置编码</h3>
+
+        <pre><code>for (int i = 0; i &lt; dim; i+=2) {
+    int head_dim = i % head_size;
+    float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+    float val = pos * freq;
+    float fcr = cosf(val);
+    float fci = sinf(val);
+    int rotn = i &lt; kv_dim ? 2 : 1;
+    for (int v = 0; v &lt; rotn; v++) {
+        float* vec = v == 0 ? s-&gt;q : s-&gt;k;
+        float v0 = vec[i];
+        float v1 = vec[i+1];
+        vec[i]   = v0 * fcr - v1 * fci;
+        vec[i+1] = v0 * fci + v1 * fcr;
+    }
+}</code></pre>
+
+        <p>这一段如果第一次看，会有点懵。我来翻译一下它在干嘛。</p>
+
+        <p>
+          <strong>问题</strong>：attention 这个操作本身是"位置无关"的——
+          你把序列打乱顺序，结果不变。所以必须想办法注入"我是第几个位置"的信息。
+        </p>
+
+        <p>
+          <strong>老办法</strong>：在 embedding 上加一个 <code>sin(pos)</code>、<code>cos(pos)</code>
+          之类的"位置编码"向量。
+        </p>
+
+        <p>
+          <strong>RoPE 的办法</strong>：把 Q 和 K 看成一堆 2D 复数（每相邻两个 float 当一个复数），
+          然后<strong>根据位置 pos 把每个复数旋转一个角度</strong>。
+          旋转角度跟 <code>pos × freq</code> 成正比，频率随维度递减。
+        </p>
+
+        <p>
+          数学上的好处是：两个向量的点积只取决于它们的<strong>相对位置差</strong>。
+          这就是"相对位置编码"——它对长度外推有更好的特性。
+        </p>
+
+        <p>代码角度看：</p>
+
+        <ul>
+          <li>每两个相邻浮点 <code>(v0, v1)</code> 看成一个 2D 向量。</li>
+          <li><code>(fcr, fci)</code> 是 <code>(cos θ, sin θ)</code>，角度由 <code>pos</code> 和频率决定。</li>
+          <li>经典 2D 旋转矩阵套上去：
+            <pre><code>[v0']   [cos θ  -sin θ] [v0]
+[v1'] = [sin θ   cos θ] [v1]</code></pre>
+          </li>
+        </ul>
+
+        <p>
+          <code>rotn = i &lt; kv_dim ? 2 : 1</code> 这个判断处理 GQA：
+          在 K 的维度范围内同时旋转 Q 和 K，超出之后只旋转 Q（因为 K 已经没那么多维度了）。
+        </p>
+
+        <h3>5.6 多头注意力：核心循环</h3>
+
+        <pre><code>#pragma omp parallel for private(h)
+for (h = 0; h &lt; p-&gt;n_heads; h++) {
+    float* q = s-&gt;q + h * head_size;
+    float* att = s-&gt;att + h * p-&gt;seq_len;
+
+    // 算 attention scores: q · k_t for t = 0..pos
+    for (int t = 0; t &lt;= pos; t++) {
+        float* k = s-&gt;key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+        float score = 0.0f;
+        for (int i = 0; i &lt; head_size; i++) score += q[i] * k[i];
+        score /= sqrtf(head_size);
+        att[t] = score;
+    }
+
+    // softmax
+    softmax(att, pos + 1);
+
+    // weighted sum of values
+    float* xb = s-&gt;xb + h * head_size;
+    memset(xb, 0, head_size * sizeof(float));
+    for (int t = 0; t &lt;= pos; t++) {
+        float* v = s-&gt;value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+        float a = att[t];
+        for (int i = 0; i &lt; head_size; i++) xb[i] += a * v[i];
+    }
+}</code></pre>
+
+        <p>这就是 attention 的全部。用人话翻译：</p>
+
+        <p>对每个头 <code>h</code>：</p>
+
+        <ol>
+          <li><strong>算分数</strong>：当前位置的 Q 跟 cache 里位置 <code>0..pos</code> 所有的 K 做点积，
+              得到一组分数。除以 <code>sqrt(head_size)</code> 是为了数值稳定。</li>
+          <li><strong>softmax</strong>：把分数变成"权重"，加起来等于 1。</li>
+          <li><strong>加权求和</strong>：用这组权重把对应的 V 加起来，就是这个头的输出。</li>
+        </ol>
+
+        <p>
+          注意 <code>(h / kv_mul) * head_size</code> 这个偏移——这就是 GQA 的体现：
+          Q 头 <code>h</code> 共享 KV 头 <code>h / kv_mul</code>。
+        </p>
+
+        <p>
+          <code>#pragma omp parallel for</code> 是 OpenMP 提示——如果用 <code>make runomp</code>
+          编译，多头之间就会被自动并行化。这就是 llama2.c 的"魔法"：
+          写得跟单线程一样朴素，靠一行 pragma 就能多线程。
+        </p>
+
+        <blockquote>
+          这里<strong>没有</strong> mask！为什么？因为我们是逐 token 生成的，
+          cache 里只有 <code>0..pos</code> 的 K/V，根本没有"未来"的 token 可以看。
+          Causal mask 在训练时是必要的，但在 autoregressive decoding 里隐式地由
+          "cache 里只有过去"实现了。
+        </blockquote>
+
+        <h3>5.7 输出投影 + 残差</h3>
+
+        <pre><code>matmul(s-&gt;xb2, s-&gt;xb, w-&gt;wo + l*dim*dim, dim, dim);
+for (int i = 0; i &lt; dim; i++) x[i] += s-&gt;xb2[i];</code></pre>
+
+        <p>把多头拼起来过 <code>wo</code>，然后加回到主流 <code>x</code> 上——这就是残差连接。</p>
+
+        <h3>5.8 FFN：SwiGLU</h3>
+
+        <pre><code>rmsnorm(s-&gt;xb, x, w-&gt;rms_ffn_weight + l*dim, dim);
+matmul(s-&gt;hb,  s-&gt;xb, w-&gt;w1 + l*dim*hidden_dim, dim, hidden_dim);
+matmul(s-&gt;hb2, s-&gt;xb, w-&gt;w3 + l*dim*hidden_dim, dim, hidden_dim);
+
+for (int i = 0; i &lt; hidden_dim; i++) {
+    float val = s-&gt;hb[i];
+    val *= (1.0f / (1.0f + expf(-val)));   // silu(x) = x * sigmoid(x)
+    val *= s-&gt;hb2[i];                       // 乘 w3(x)
+    s-&gt;hb[i] = val;
+}
+matmul(s-&gt;xb, s-&gt;hb, w-&gt;w2 + l*dim*hidden_dim, hidden_dim, dim);
+
+for (int i = 0; i &lt; dim; i++) x[i] += s-&gt;xb[i];</code></pre>
+
+        <p>公式：</p>
+
+        <pre><code>FFN(x) = w2( silu(w1(x)) ⊙ w3(x) )
+其中 silu(x) = x * sigmoid(x)</code></pre>
+
+        <p>跟传统 FFN（<code>w2(relu(w1(x)))</code>）的区别：</p>
+
+        <ul>
+          <li>多了一个 <code>w3</code> 分支，做"门控"——<code>w3(x)</code> 决定每个维度让多少
+              <code>silu(w1(x))</code> 通过。</li>
+          <li>用 <code>silu</code> 而不是 <code>relu</code>，更平滑。</li>
+        </ul>
+
+        <p>
+          这就是 GLU (Gated Linear Unit) 家族的 SwiGLU 变体。
+          Llama 用了它，PaLM 也用了。代价是参数量比传统 FFN 多 1.5 倍（多了一个矩阵 w3），但效果好。
+        </p>
+
+        <p>最后再加一次残差，结束这一层。</p>
+
+        <h3>5.9 出 Block 后：最后归一化 + 分类头</h3>
+
+        <pre><code>rmsnorm(x, x, w-&gt;rms_final_weight, dim);
+matmul(s-&gt;logits, x, w-&gt;wcls, p-&gt;dim, p-&gt;vocab_size);
+return s-&gt;logits;</code></pre>
+
+        <p>
+          走完 N 层之后，做一次最终的 RMSNorm，
+          然后乘上分类矩阵 <code>wcls</code>（如果开了 weight tying，
+          它就是 <code>token_embedding_table</code> 本身），得到 <code>vocab_size</code> 维的 logits。
+        </p>
+
+        <p>至此 forward 结束。下一节讲怎么从 logits 抽 token。</p>
+
+        <h2>6. Sampler：怎么从 logits 选下一个 token</h2>
+
+        <p>
+          <code>forward()</code> 出来的是 <code>[vocab_size]</code> 维 logits，
+          你需要从里面挑一个 token。<code>run.c</code> 提供了三种策略：
+        </p>
+
+        <h3>6.1 Greedy（temperature == 0）</h3>
+
+        <pre><code>int sample_argmax(float* probabilities, int n) {
+    // 直接挑得分最高的
+}</code></pre>
+
+        <p>
+          简单暴力，输出<strong>完全确定</strong>——同样的 prompt 出来的永远是同样的文本。
+          适合调试和测试（<code>test_all.py</code> 就是用 <code>-t 0</code> 来保证可复现）。
+        </p>
+
+        <h3>6.2 Temperature sampling</h3>
+
+        <pre><code>for (int q = 0; q &lt; vocab_size; q++) logits[q] /= temperature;
+softmax(logits, vocab_size);
+// 然后按概率分布抽</code></pre>
+
+        <p>把 logits 除以 temperature，再 softmax 成概率，再按概率抽样。</p>
+
+        <ul>
+          <li>temperature &lt; 1：分布变尖，更像 greedy。</li>
+          <li>temperature &gt; 1：分布变平，更随机。</li>
+          <li>temperature == 1：原始分布。</li>
+        </ul>
+
+        <h3>6.3 Top-p（nucleus）sampling</h3>
+
+        <pre><code>int sample_topp(float* probabilities, int n, float topp, ...) {
+    // 1. 按概率从大到小排序
+    // 2. 累加，直到累计概率超过 topp（比如 0.9）
+    // 3. 只在这个"核"里采样
+}</code></pre>
+
+        <p>
+          只在"概率累计前 90%"的 token 里抽样，过滤掉长尾的低概率 token。
+          这能避免模型偶尔抽到一些意外的、让生成"跑偏"的 token。
+        </p>
+
+        <p>
+          实际中常用 <code>-t 1.0 -p 0.9</code>，作者在 README 里也是这么推荐的。
+        </p>
+
+        <blockquote>
+          一个工程小技巧：<code>sample_topp</code> 里有个
+          <code>cutoff = (1 - topp) / (n - 1)</code>，先粗筛掉所有小于这个阈值的 token，再排序。
+          这能把 <code>vocab_size = 32000</code> 的排序压力从全量降到几百个，是个非常实用的优化。
+        </blockquote>
+
+        <h3>6.4 RNG</h3>
+
+        <pre><code>unsigned int random_u32(unsigned long long *state) {
+    *state ^= *state &gt;&gt; 12;
+    *state ^= *state &lt;&lt; 25;
+    *state ^= *state &gt;&gt; 27;
+    return (*state * 0x2545F4914F6CDD1Dull) &gt;&gt; 32;
+}</code></pre>
+
+        <p>
+          xorshift* 算法，自带 seed，可复现。
+          不依赖 <code>rand()</code> 是因为不同平台的 <code>rand()</code> 行为不一致。
+        </p>
+
+        <h2>7. Tokenizer：BPE 是什么</h2>
+
+        <p>
+          LLM 不是按字符也不是按词工作，而是按 <strong>subword token</strong>。
+          比如 <code>"Once"</code> 可能就是一个 token，但 <code>"Onnomatopoeia"</code> 这种生僻词
+          会被切成 <code>["On", "nomato", "poeia"]</code> 之类。
+        </p>
+
+        <p>Llama 用的是 SentencePiece BPE。<code>tokenizer.bin</code> 文件里存的是：</p>
+
+        <pre><code>[max_token_length: int32]
+对每个 token i (0 &lt;= i &lt; vocab_size):
+  [score: float32]
+  [length: int32]
+  [bytes: length 个字节]</code></pre>
+
+        <p><code>run.c</code> 读取这个文件，把每个 token id 对应的字符串和分数存起来。</p>
+
+        <h3>7.1 编码：encode() 在干嘛</h3>
+
+        <p>BPE 的编码算法在 <code>run.c</code> 里大致是这样：</p>
+
+        <ol>
+          <li><strong>逐字符切</strong>：把输入字符串按 UTF-8 codepoint 切开，每个 codepoint 查表得到一个 token id。
+              如果查不到（生僻字符），fallback 成 byte token。</li>
+          <li><strong>贪心合并</strong>：循环扫一遍当前 token 序列，找出能合并成"分数最高的"那个 token 的相邻 pair，合并它。
+              一直合并直到没有能合并的 pair 为止。</li>
+        </ol>
+
+        <pre><code>while (1) {
+    float best_score = -1e10;
+    int best_id = -1;
+    int best_idx = -1;
+    for (int i = 0; i &lt; (*n_tokens - 1); i++) {
+        sprintf(str_buffer, "%s%s", t-&gt;vocab[tokens[i]], t-&gt;vocab[tokens[i+1]]);
+        int id = str_lookup(str_buffer, t-&gt;sorted_vocab, t-&gt;vocab_size);
+        if (id != -1 &amp;&amp; t-&gt;vocab_scores[id] &gt; best_score) {
+            best_score = t-&gt;vocab_scores[id];
+            best_id = id;
+            best_idx = i;
+        }
+    }
+    if (best_idx == -1) break;
+    tokens[best_idx] = best_id;
+    // 删除 best_idx+1，整个序列前移一位
+    ...
+}</code></pre>
+
+        <p>
+          时间复杂度其实不太好（每轮 O(n × vocab lookup)），
+          但对大模型推理来说 prompt 长度通常几百 token，编码时间相比 forward 可以忽略。
+        </p>
+
+        <h3>7.2 解码：decode() 的小细节</h3>
+
+        <pre><code>char* decode(Tokenizer* t, int prev_token, int token) {
+    char *piece = t-&gt;vocab[token];
+    if (prev_token == 1 &amp;&amp; piece[0] == ' ') { piece++; }   // BOS 后剥前导空格
+    unsigned char byte_val;
+    if (sscanf(piece, "&lt;0x%02hhX&gt;", &amp;byte_val) == 1) {     // 处理 byte fallback token
+        piece = (char*)t-&gt;byte_pieces + byte_val * 2;
+    }
+    return piece;
+}</code></pre>
+
+        <p>两个细节：</p>
+        <ul>
+          <li>SentencePiece 习惯在 BOS 后剥掉前导空格。</li>
+          <li>一些 token 是 <code>&lt;0x41&gt;</code> 这种字面 byte，要解析成实际 byte。</li>
+        </ul>
+
+        <h2>8. 主循环：把这些拼起来</h2>
+
+        <pre><code>void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+              char *prompt, int steps) {
+    int* prompt_tokens = ...;
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &amp;num_prompt_tokens);
+
+    int token = prompt_tokens[0];
+    int pos = 0;
+    while (pos &lt; steps) {
+        float* logits = forward(transformer, token, pos);
+
+        int next;
+        if (pos &lt; num_prompt_tokens - 1) {
+            next = prompt_tokens[pos + 1];   // prompt 阶段，下一个 token 用真实的
+        } else {
+            next = sample(sampler, logits);  // generate 阶段，从 logits 采样
+        }
+        pos++;
+
+        if (next == 1) break;   // BOS 当作终止信号
+
+        char* piece = decode(tokenizer, token, next);
+        safe_printf(piece);
+        fflush(stdout);
+
+        token = next;
+    }
+}</code></pre>
+
+        <p>这里有个非常重要的概念：<strong>prefill vs decode</strong>。</p>
+
+        <ul>
+          <li>当 <code>pos &lt; num_prompt_tokens - 1</code> 时：我们在"消化 prompt"。
+              每一步还是调 <code>forward()</code>，但<strong>不用采样</strong>——
+              直接拿下一个 prompt token 当 <code>next</code>。这样 KV cache 被填充起来，但输出被忽略。</li>
+          <li>当 <code>pos &gt;= num_prompt_tokens - 1</code> 时：prompt 消化完了，开始真正生成。
+              每步采样得到 <code>next</code>，下次再喂回去。</li>
+        </ul>
+
+        <p>
+          llama2.c 的 prefill 和 decode 用的是<strong>同一段代码</strong>——一次只算一个 token。
+          这在工程上很简洁，但效率不是最优。
+          生产引擎（vLLM、TensorRT-LLM）会让 prefill 一次性把所有 prompt token 拼成一个 batch 喂进去，
+          能更好地利用 GPU。
+        </p>
+
+        <h2>9. Chat 模式：仅仅是套了个 prompt 模板</h2>
+
+        <p><code>chat()</code> 函数干的事其实非常朴素：</p>
+
+        <pre><code>char system_template[] = "[INST] &lt;&lt;SYS&gt;&gt;\n%s\n&lt;&lt;/SYS&gt;&gt;\n\n%s [/INST]";
+char user_template[]   = "[INST] %s [/INST]";</code></pre>
+
+        <p>
+          把用户输入按 Llama 2 Chat 的格式套一下，喂给同一个 <code>forward()</code>。
+          模型的"对话能力"完全来自训练时见过的数据格式。
+        </p>
+
+        <p>
+          EOS（token id = 2）作为 assistant 回合的结束信号；
+          遇到它就停止生成、把 <code>user_turn</code> 设回 1，等下一轮用户输入。
+        </p>
+
+        <p>
+          这个例子让我意识到：
+          <strong>对话格式不是模型的属性，是 prompt 的约定</strong>。
+          任何 chat tuned 模型都只是在某种特定格式上 fine-tune 过。
+        </p>
+
+        <h2>10. 量化：runq.c 简单聊</h2>
+
+        <p><code>runq.c</code> 跟 <code>run.c</code> 几乎一样，只在两点不同：</p>
+
+        <ol>
+          <li><strong>权重存储</strong>：所有矩阵权重都被量化成 int8，
+              按 group（默认 64 个元素一组）共享一个 fp32 scale。
+              也就是 Q8_0 格式（llama.cpp 的术语）。</li>
+          <li><strong>matmul 的输入也量化</strong>：每次 matmul 前，
+              把 fp32 激活动态量化成 int8，然后做 int8 × int8 累加，最后乘回 scale。</li>
+        </ol>
+
+        <p>收益：</p>
+
+        <ul>
+          <li><strong>模型变小 4 倍</strong>：fp32 weight 4 字节，int8 weight 1 字节（外加少量 scale 开销）。</li>
+          <li><strong>matmul 变快</strong>：int8 × int8 的整数乘加，CPU 上跑得比 fp32 快几倍。</li>
+        </ul>
+
+        <p>
+          代价：略微的精度损失。Q8_0 是个非常保守的量化方案——只在矩阵权重上做，
+          scale 还是 fp32，RMSNorm 这类敏感算子完全不动。所以质量损失非常小。
+        </p>
+
+        <blockquote>
+          ONNX 部署里你做过 INT8 量化的话这里不会陌生：
+          本质上就是 weight + activation per-group symmetric quantization。
+          区别是这里没有 calibration——它是 PTQ 但用的是 <code>min(|w|)/127</code>
+          这种最朴素的 scale 算法，不做误差最小化。
+        </blockquote>
+
+        <h2>11. 训练侧（model.py）一瞥</h2>
+
+        <p><code>model.py</code> 是 PyTorch 写的训练代码。和 <code>run.c</code> 的差异：</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>维度</th>
+                <th>model.py</th>
+                <th>run.c</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>一次处理</td>
+                <td>整个 batch × 整个序列</td>
+                <td>单个 token</td>
+              </tr>
+              <tr>
+                <td>KV cache</td>
+                <td>不需要</td>
+                <td>必须有</td>
+              </tr>
+              <tr>
+                <td>Causal mask</td>
+                <td>显式构造</td>
+                <td>隐式（cache 里没未来）</td>
+              </tr>
+              <tr>
+                <td>RoPE</td>
+                <td>预计算 freqs，前向时查表</td>
+                <td>每步重算 sincos</td>
+              </tr>
+              <tr>
+                <td>Attention</td>
+                <td><code>F.scaled_dot_product_attention</code> (Flash)</td>
+                <td>手写 for 循环</td>
+              </tr>
+              <tr>
+                <td>数据类型</td>
+                <td>fp32 / bf16 / fp16</td>
+                <td>fp32（runq.c 是 int8）</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          从 PyTorch 训练完之后，<code>export.py</code> 把模型按上面"Section 2"讲过的
+          <code>.bin</code> 格式 dump 出来：
+        </p>
+
+        <pre><code>python export.py out/model.bin --version 0   # fp32 v0 给 run.c
+python export.py out/model.bin --version 2   # int8 v2 给 runq.c</code></pre>
+
+        <p>
+          序列化的代码全在 <code>serialize_fp32()</code> 和 <code>serialize_int8()</code> 里，
+          几行就写完。
+        </p>
+
+        <h2>12. 怎么自己跑一遍</h2>
+
+        <pre><code># 拉代码
+git clone https://github.com/karpathy/llama2.c.git
+cd llama2.c
+
+# 拿一个 15M 的玩具模型
+wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+
+# 编译
+make runfast      # 或者 make run / make runomp
+
+# 跑！
+./run stories15M.bin -t 0.8 -n 256 -i "Once upon a time, Lily met a Shoggoth"</code></pre>
+
+        <p>
+          我自己 M1 MacBook 上跑 <code>stories15M</code>，大概 100+ tok/s，
+          看着 token 一个一个流出来非常爽。
+        </p>
+
+        <p>如果想跑测试对齐 PyTorch 输出：</p>
+
+        <pre><code>make run        # 必须先构建 ./run
+pytest          # 会自动下载 stories260K，跑 200 步对齐</code></pre>
+
+        <h2>13. 学完这些之后，可以做什么</h2>
+
+        <p>我自己列的一个学习路径：</p>
+
+        <ol>
+          <li><strong>改 <code>run.c</code> 的 sampler</strong>：加个 top-k、加个 repetition penalty、加个 mirostat。</li>
+          <li><strong>加一个 batch 维度</strong>：让 <code>forward()</code> 接受多个 token 同时算，看看 prefill 加速能到什么程度。</li>
+          <li><strong>写一个 CUDA 版本</strong>：把 matmul、attention、softmax 换成 CUDA kernel。仓库 todo 里就有 <code>run.cu</code>。</li>
+          <li><strong>去看 <code>llama.cpp</code></strong>：现在再去看 <code>ggml</code>、<code>ggml-alloc</code>、<code>ggml-cuda</code>，每个数据结构都有了一个 llama2.c 的对应物可以参照。</li>
+          <li><strong>去看 vLLM 的 PagedAttention</strong>：理解为什么"KV cache 是块连续 buffer"在 batch serving 场景下不够用。</li>
+        </ol>
+
+        <p>llama2.c 给我最大的启发是：<strong>LLM 推理引擎本质上不复杂</strong>。复杂的是：</p>
+
+        <ul>
+          <li>怎么让它在一张 H100 上跑到 90% 利用率。</li>
+          <li>怎么让 100 个并发请求共享一个 KV cache 池。</li>
+          <li>怎么把上下文从 4K 扩到 1M。</li>
+          <li>怎么把模型从 fp16 量到 int4 还不掉精度。</li>
+        </ul>
+
+        <p>
+          这些都是工程问题，但<strong>核心算法</strong>
+          （attention、KV cache、RoPE、SwiGLU、采样）就是 <code>run.c</code> 这 700 行写的东西。
+        </p>
+
+        <p>读懂这 700 行，你就有了那张可以查所有问题的"参照地图"。</p>
+
+        <h2>附：常见疑问</h2>
+
+        <p><strong>Q: 为什么 <code>run.c</code> 不支持 batch？</strong></p>
+        <p>A: 设计选择。Karpathy 的目标是"教学用 + 单用户本地推理"。加 batch 维度会让代码长不少。</p>
+
+        <p><strong>Q: 为什么不用 SIMD（AVX、NEON）？</strong></p>
+        <p>A: 同样是为了简单。靠 <code>-O3 -march=native</code> 让编译器自动向量化，已经能拿到不错的性能。要极致性能就上 <code>llama.cpp</code>。</p>
+
+        <p><strong>Q: 7B 以上为什么跑不动？</strong></p>
+        <p>A: README 里提到，13B+ 的指针运算会有 int 溢出 bug；另外 fp32 推理 13B 模型要 50GB 内存、跑得也慢。runq.c 把内存压到 1/4，但仍然慢——主要是单线程 CPU 推理本身的极限。</p>
+
+        <p><strong>Q: 这跟 ONNX Runtime / TensorRT 比有什么差距？</strong></p>
+        <p>A: 巨大。生产引擎有：fused kernel、显存复用、连续 batching、speculative decoding、PagedAttention、各种精度的量化。llama2.c 没有任何这些——它的价值是<strong>让你看懂这些优化想解决什么问题</strong>。</p>
+
+        <p>
+          如果你看到这里，建议下一步：把 <code>run.c</code> 在编辑器里打开，对着这篇文章每节走一遍。
+          代码就在那里，700 行，没有任何隐藏。
+        </p>
+
+        <footer class="post-footer">
+          <a href="../index.html">Back to all posts</a>
+        </footer>
+      </article>
+    </main>
+  </body>
+</html>

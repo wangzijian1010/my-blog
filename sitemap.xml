@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://wangzijian1010.github.io/my-blog/</loc><lastmod>2026-05-08</lastmod></url>
-  <url><loc>https://wangzijian1010.github.io/my-blog/archive.html</loc><lastmod>2026-05-08</lastmod></url>
+  <url><loc>https://wangzijian1010.github.io/my-blog/</loc><lastmod>2026-05-09</lastmod></url>
+  <url><loc>https://wangzijian1010.github.io/my-blog/archive.html</loc><lastmod>2026-05-09</lastmod></url>
+  <url><loc>https://wangzijian1010.github.io/my-blog/posts/lite-ai-toolkit-llm-roadmap.html</loc><lastmod>2026-05-09</lastmod></url>
+  <url><loc>https://wangzijian1010.github.io/my-blog/posts/llama2-c-reading-guide.html</loc><lastmod>2026-05-09</lastmod></url>
+  <url><loc>https://wangzijian1010.github.io/my-blog/posts/llama2-c-walkthrough.html</loc><lastmod>2026-05-09</lastmod></url>
   <url><loc>https://wangzijian1010.github.io/my-blog/posts/facefusion-trt-pipeline-optimization.html</loc><lastmod>2026-05-08</lastmod></url>
   <url><loc>https://wangzijian1010.github.io/my-blog/posts/lite-ai-performance.html</loc><lastmod>2026-05-07</lastmod></url>
   <url><loc>https://wangzijian1010.github.io/my-blog/posts/yolov8n-tensorrt-single-inference.html</loc><lastmod>2026-05-06</lastmod></url>

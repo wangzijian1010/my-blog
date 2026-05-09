@@ -6,7 +6,28 @@
     <link>https://wangzijian1010.github.io/my-blog/</link>
     <atom:link href="https://wangzijian1010.github.io/my-blog/feed.xml" rel="self" type="application/rss+xml" />
     <language>zh-CN</language>
-    <lastBuildDate>Fri, 08 May 2026 00:00:00 +0800</lastBuildDate>
+    <lastBuildDate>Sat, 09 May 2026 00:00:00 +0800</lastBuildDate>
+    <item>
+      <title>给 lite.ai.toolkit 加 LLM 推理：路线 + 待办</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/lite-ai-toolkit-llm-roadmap.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/lite-ai-toolkit-llm-roadmap.html</guid>
+      <description>给 xlite-dev/lite.ai.toolkit 这个 4.4k stars 的 C++ TRT 工具包增加 LLM 推理子模块的目标、阶段拆分和具体待办清单。本地浏览器持久化勾选状态。</description>
+      <pubDate>Sat, 09 May 2026 00:00:00 +0800</pubDate>
+    </item>
+    <item>
+      <title>llama2.c 精读指引：只读这 5 段，为写 LLM TRT 模块备课</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/llama2-c-reading-guide.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/llama2-c-reading-guide.html</guid>
+      <description>把 karpathy/llama2.c 的 700 行压缩到 1.5 小时能看完的核心部分，目的是给后面在 lite.ai.toolkit 里写 LLM TRT 推理模块备课。</description>
+      <pubDate>Sat, 09 May 2026 00:00:00 +0800</pubDate>
+    </item>
+    <item>
+      <title>啃完 llama2.c：从 ONNX 部署到自己写一个 LLM 推理引擎</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/llama2-c-walkthrough.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/llama2-c-walkthrough.html</guid>
+      <description>700 行 C 跑通 Llama 2 推理。给从 CV/ONNX 转过来、第一次看 Transformer 推理代码的人。</description>
+      <pubDate>Sat, 09 May 2026 00:00:00 +0800</pubDate>
+    </item>
     <item>
       <title>FaceFusion TensorRT 换脸管线优化设想</title>
       <link>https://wangzijian1010.github.io/my-blog/posts/facefusion-trt-pipeline-optimization.html</link>

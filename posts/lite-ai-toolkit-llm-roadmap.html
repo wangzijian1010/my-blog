@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>给 lite.ai.toolkit 加 LLM 推理：路线 + 待办 | 慢慢写</title>
+    <meta
+      name="description"
+      content="给 xlite-dev/lite.ai.toolkit 这个 4.4k stars 的 C++ TRT 工具包增加 LLM 推理子模块的目标、阶段拆分和具体待办清单。本地浏览器持久化勾选状态。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="给 lite.ai.toolkit 加 LLM 推理：路线 + 待办">
+    <meta property="og:description" content="给 xlite-dev/lite.ai.toolkit 这个 4.4k stars 的 C++ TRT 工具包增加 LLM 推理子模块的目标、阶段拆分和具体待办清单。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/lite-ai-toolkit-llm-roadmap.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+    <style>
+      ul.todo {
+        list-style: none;
+        padding-left: 0;
+      }
+      ul.todo li {
+        padding: 0.35rem 0;
+        line-height: 1.55;
+      }
+      ul.todo input[type="checkbox"] {
+        margin-right: 0.55rem;
+        cursor: pointer;
+        transform: translateY(1px);
+      }
+      ul.todo input[type="checkbox"]:checked + label {
+        opacity: 0.42;
+        text-decoration: line-through;
+      }
+      ul.todo li ul.todo {
+        padding-left: 1.5rem;
+        margin-top: 0.15rem;
+        margin-bottom: 0.4rem;
+      }
+      ul.todo label {
+        cursor: pointer;
+      }
+      h2 .progress {
+        font-size: 0.78rem;
+        opacity: 0.45;
+        margin-left: 0.5rem;
+        font-weight: normal;
+        font-variant-numeric: tabular-nums;
+      }
+      h3 .progress {
+        font-size: 0.72rem;
+        opacity: 0.45;
+        margin-left: 0.4rem;
+        font-weight: normal;
+        font-variant-numeric: tabular-nums;
+      }
+      .scope-out {
+        opacity: 0.85;
+      }
+      .scope-out li::before {
+        content: "✗ ";
+        opacity: 0.55;
+        margin-right: 0.2rem;
+      }
+      .scope-out {
+        list-style: none;
+        padding-left: 0;
+      }
+      .scope-out li {
+        padding: 0.25rem 0;
+      }
+      .reset-btn {
+        margin-top: 1.5rem;
+        font-size: 0.8rem;
+        opacity: 0.5;
+        background: none;
+        border: 1px solid currentColor;
+        padding: 0.25rem 0.7rem;
+        border-radius: 3px;
+        cursor: pointer;
+        color: inherit;
+        font-family: inherit;
+      }
+      .reset-btn:hover {
+        opacity: 0.85;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../index.html#posts">Posts</a>
+        <a href="../archive.html">Archive</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">project plan</p>
+          <h1>给 lite.ai.toolkit 加 LLM 推理：路线 + 待办</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-09">2026.05.09</time>
+            <span>LLM</span>
+            <span>TensorRT</span>
+            <span>OSS</span>
+            <span>Roadmap</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          这篇不是一篇文章，是一份给我自己看的项目跟踪表。目标：在
+          <code>xlite-dev/lite.ai.toolkit</code> 这个 4.4k stars 的 C++ TRT 工具包里
+          加一个 LLM 推理子模块。下面的 checkbox 状态会被存在本地浏览器里，
+          所以下次打开这一页，已经勾过的还在。
+          每个阶段标题后会自动显示进度，例如
+          <span class="progress">3 / 7</span>。
+        </p>
+
+        <h2>目标（3–6 个月）</h2>
+
+        <p><strong>主目标</strong></p>
+
+        <ul>
+          <li>在 lite.ai.toolkit 仓库里有一个被 maintainer 合并的 LLM 子模块（<code>lite/trt/llm/</code>），至少包含一个完整可运行的模型（计划是 Qwen2.5-0.5B）</li>
+          <li>配套 5 到 8 篇带 benchmark 数据的博客文章，按现有"慢慢写"的写法</li>
+          <li>3080 Ti 上至少跑通：FP16 baseline、KV cache 重用、CUDA Graph、INT8 weight-only 量化 这四组对比数字</li>
+        </ul>
+
+        <p><strong>衍生目标</strong></p>
+
+        <ul>
+          <li>简历 / GitHub profile 上能写"4.4k stars OSS 项目核心模块贡献者"</li>
+          <li>长期定位从"CV TRT 加速"转向"CV 加速 + 多模态 LLM 推理"，差异化避免和大盘子卷</li>
+          <li>积累一份可以反复在新模型上复用的 LLM 推理工程化模板（KV cache、采样器、ONNX 导出脚本、benchmark 框架）</li>
+        </ul>
+
+        <h2>不在范围内（显式 anti-scope）</h2>
+
+        <p>这一节的优先级高于待办清单本身。最常见的失败模式是做着做着范围漂移，所以把不做的事情列出来。</p>
+
+        <ul class="scope-out">
+          <li>不做 vLLM / TRT-LLM 的平替——这是错位的目标，做不完</li>
+          <li>不做训练相关（包括 LoRA / fine-tuning / RLHF）</li>
+          <li>不做 7B 以上的模型（3080 Ti 12GB 显存做不动 FP16；INT8 量化的 7B 是上限）</li>
+          <li>不引入新的第三方依赖——尊重 toolkit 的"lite"定位，第一版 tokenizer 自己写，不引入 sentencepiece / tokenizers-cpp</li>
+          <li>不做 multi-GPU / tensor parallel / pipeline parallel</li>
+          <li>不做服务化框架（HTTP server、scheduler、batch manager），只做单进程推理库</li>
+          <li>不做 FP8 量化——3080 Ti 不支持，等以后换卡</li>
+        </ul>
+
+        <h2 data-phase="probe">能力探针：先用 2 周验证我能不能走 <span class="progress" data-progress-for="probe"></span></h2>
+
+        <p>
+          这一阶段的目标不是产出代码，是验证"我有没有能力把这条路走完"。
+          数据出来再决定要不要 commit 后续 phase。
+        </p>
+
+        <ul class="todo" data-phase-group="probe">
+          <li><input type="checkbox" id="p-1"><label for="p-1">通读 karpathy/llama2.c 的 700 行单文件实现</label></li>
+          <li><input type="checkbox" id="p-2"><label for="p-2">能在白纸上画出 KV cache 在内存里的布局（per layer / per head / seq 维度）</label></li>
+          <li><input type="checkbox" id="p-3"><label for="p-3">能用一句话解释 prefill 和 decode 阶段为什么要分开</label></li>
+          <li><input type="checkbox" id="p-4"><label for="p-4">看完 3Blue1Brown transformer 系列的 attention 和 GPT 两集</label></li>
+          <li><input type="checkbox" id="p-5"><label for="p-5">用 HuggingFace transformers + optimum 把 Qwen2.5-0.5B 导出成带 past_key_values 的 ONNX</label></li>
+          <li><input type="checkbox" id="p-6"><label for="p-6">用 onnxruntime-gpu 在 3080 Ti 上跑通一次 ONNX 推理（Python，不用 C++）</label></li>
+          <li><input type="checkbox" id="p-7"><label for="p-7">记录 HuggingFace transformers FP16 的 baseline tokens/s（这是后面 benchmark 的对照基准）</label></li>
+          <li><input type="checkbox" id="p-8"><label for="p-8">写一篇博客记录这两周的探针结果（独立于本路线表）</label></li>
+        </ul>
+
+        <p>
+          <strong>判断标准</strong>：以上 8 条至少完成 6 条，且没有任何一条让我"完全卡住、看不到出路"。
+          满足就进 Phase 0；不满足就回头看具体是哪一条卡住，针对性补，而不是放弃整条路线。
+        </p>
+
+        <h2 data-phase="phase0">Phase 0：发 RFC issue（1 天） <span class="progress" data-progress-for="phase0"></span></h2>
+
+        <ul class="todo" data-phase-group="phase0">
+          <li><input type="checkbox" id="p0-1"><label for="p0-1">起草英文 RFC issue 草稿，标题 <em>Proposal: Add LLM inference module under <code>lite/trt/llm/</code></em></label></li>
+          <li><input type="checkbox" id="p0-2"><label for="p0-2">RFC 里写清楚：目标、模块边界、依赖策略（无新依赖）、Phase 1 的 4 个 PR 拆分、第一个模型选型理由</label></li>
+          <li><input type="checkbox" id="p0-3"><label for="p0-3">提到顺手把 SD 的 CLIP/UNet/VAE 重构进 <code>BasicTRTHandler</code> 基类作为附赠</label></li>
+          <li><input type="checkbox" id="p0-4"><label for="p0-4">在我自己的 fork 上把 PR1（tokenizer）提前写好作为 sample，issue 里附上 fork 链接</label></li>
+          <li><input type="checkbox" id="p0-5"><label for="p0-5">提交 issue，等 owner 反馈</label></li>
+          <li><input type="checkbox" id="p0-6"><label for="p0-6">收到反馈后调整 roadmap（如果方向被否，记录原因，不强行推进）</label></li>
+        </ul>
+
+        <h2 data-phase="phase1">Phase 1：最小可跑模块（6–9 周） <span class="progress" data-progress-for="phase1"></span></h2>
+
+        <h3 data-phase="phase1-pr1">PR1：Tokenizer 抽象 + GPT2-style BPE（1.5 周） <span class="progress" data-progress-for="phase1-pr1"></span></h3>
+
+        <ul class="todo" data-phase-group="phase1-pr1">
+          <li><input type="checkbox" id="p1a-1"><label for="p1a-1">抽象 <code>Tokenizer</code> 基类：encode / decode / special_tokens 接口</label></li>
+          <li><input type="checkbox" id="p1a-2"><label for="p1a-2">实现 <code>GPT2BPETokenizer</code>，从 <code>vocab.json</code> + <code>merges.txt</code> 运行时加载（不内嵌进二进制）</label></li>
+          <li><input type="checkbox" id="p1a-3"><label for="p1a-3">让现有 <code>CLIPTokenizer</code> 继承新基类（保留旧行为，向后兼容）</label></li>
+          <li><input type="checkbox" id="p1a-4"><label for="p1a-4">单元测试：encode 后 decode 应等于原文，特殊 token 处理正确</label></li>
+          <li><input type="checkbox" id="p1a-5"><label for="p1a-5">用 Qwen2.5-0.5B 的 vocab 做对拍：和 HuggingFace tokenizer 输出 token id 完全一致</label></li>
+          <li><input type="checkbox" id="p1a-6"><label for="p1a-6">提交 PR，等 review</label></li>
+        </ul>
+
+        <h3 data-phase="phase1-pr2">PR2：<code>lite/trt/llm/</code> 骨架 + KVCacheBuffer + Sampler（2–3 周） <span class="progress" data-progress-for="phase1-pr2"></span></h3>
+
+        <ul class="todo" data-phase-group="phase1-pr2">
+          <li><input type="checkbox" id="p1b-1"><label for="p1b-1">创建 <code>lite/trt/llm/</code> 目录和 CMake 集成</label></li>
+          <li><input type="checkbox" id="p1b-2"><label for="p1b-2">写 <code>BasicLLMHandler : public BasicTRTHandler</code></label></li>
+          <li><input type="checkbox" id="p1b-3"><label for="p1b-3">设计并实现 <code>KVCacheBuffer</code>：device memory + slice / append / reset 接口</label></li>
+          <li><input type="checkbox" id="p1b-4"><label for="p1b-4">单元测试：KV cache slice 的偏移在不同 layer / seq 位置下都正确</label></li>
+          <li><input type="checkbox" id="p1b-5"><label for="p1b-5">实现 <code>Sampler</code>：greedy / temperature / top-k / top-p（先 CPU 实现）</label></li>
+          <li><input type="checkbox" id="p1b-6"><label for="p1b-6">单元测试：sampler 在固定 seed 下输出可复现</label></li>
+          <li><input type="checkbox" id="p1b-7"><label for="p1b-7">提交 PR，等 review</label></li>
+        </ul>
+
+        <h3 data-phase="phase1-pr3">PR3：<code>trt_qwen2.{h,cpp}</code> + example，端到端跑通（2–3 周） <span class="progress" data-progress-for="phase1-pr3"></span></h3>
+
+        <ul class="todo" data-phase-group="phase1-pr3">
+          <li><input type="checkbox" id="p1c-1"><label for="p1c-1">写 ONNX 导出脚本：Qwen2.5-0.5B 导成带 past_key_values 输入输出的 ONNX，dynamic axes 配置正确</label></li>
+          <li><input type="checkbox" id="p1c-2"><label for="p1c-2">ONNX 转 TRT engine（fp16 优先），处理 dynamic shape</label></li>
+          <li><input type="checkbox" id="p1c-3"><label for="p1c-3">实现 <code>TRTQwen2::generate()</code>：prefill context + decode context 两阶段</label></li>
+          <li><input type="checkbox" id="p1c-4"><label for="p1c-4">streaming 输出回调（<code>std::function&lt;void(const std::string&amp;)&gt;</code>）</label></li>
+          <li><input type="checkbox" id="p1c-5"><label for="p1c-5">EOS 检测 + max_new_tokens 截断</label></li>
+          <li><input type="checkbox" id="p1c-6"><label for="p1c-6">写 example <code>examples/lite/llm/test_lite_qwen2.cpp</code>，REPL 风格 demo</label></li>
+          <li><input type="checkbox" id="p1c-7"><label for="p1c-7">写 README：ONNX 导出步骤、TRT engine 构建命令、运行示例</label></li>
+          <li><input type="checkbox" id="p1c-8"><label for="p1c-8">和 HuggingFace transformers FP16 baseline 对拍：tokens/s 数字 + 输出文本一致性</label></li>
+          <li><input type="checkbox" id="p1c-9"><label for="p1c-9">提交 PR，等 review</label></li>
+        </ul>
+
+        <h3 data-phase="phase1-pr4">PR4（软实力，可选）：把 SD 模块也重构进 BasicTRTHandler（1 周） <span class="progress" data-progress-for="phase1-pr4"></span></h3>
+
+        <ul class="todo" data-phase-group="phase1-pr4">
+          <li><input type="checkbox" id="p1d-1"><label for="p1d-1"><code>TRTClip</code> 重构为继承 <code>BasicTRTHandler</code>，消除重复的 runtime/engine/context/stream/buffers 字段</label></li>
+          <li><input type="checkbox" id="p1d-2"><label for="p1d-2"><code>TRTUNet</code> 同上</label></li>
+          <li><input type="checkbox" id="p1d-3"><label for="p1d-3"><code>TRTVae</code> 同上</label></li>
+          <li><input type="checkbox" id="p1d-4"><label for="p1d-4">手动验证 SD pipeline 输出图像和重构前像素级一致</label></li>
+          <li><input type="checkbox" id="p1d-5"><label for="p1d-5">提交 PR，等 review</label></li>
+        </ul>
+
+        <h2 data-phase="phase2">Phase 2：优化层，每条一个 PR + 一篇博客 <span class="progress" data-progress-for="phase2"></span></h2>
+
+        <p>
+          这一阶段的颗粒度比 Phase 1 粗。每一项都既是代码也是博客素材，按需挑选优先级。
+        </p>
+
+        <ul class="todo" data-phase-group="phase2">
+          <li><input type="checkbox" id="p2-1"><label for="p2-1">CUDA Graph for decode：把 decode 阶段的 enqueueV3 + memcpy 抓成 graph，单次 launch</label></li>
+          <li><input type="checkbox" id="p2-2"><label for="p2-2">KV cache 复用 / 简化版分页（小尺寸 paged attention，不追求完整实现）</label></li>
+          <li><input type="checkbox" id="p2-3"><label for="p2-3">INT8 weight-only 量化 + calibration（W8A16）</label></li>
+          <li><input type="checkbox" id="p2-4"><label for="p2-4">FP16 / INT8 / INT4 三档 benchmark + 输出质量评估，写成对比文章</label></li>
+          <li><input type="checkbox" id="p2-5"><label for="p2-5">SD 模块的 vocab.h 内嵌改成运行时加载，二进制减肥 5.2MB（独立 PR）</label></li>
+          <li><input type="checkbox" id="p2-6"><label for="p2-6">In-flight batching 探索（如果方向需要服务化场景）</label></li>
+          <li><input type="checkbox" id="p2-7"><label for="p2-7">Speculative decoding 探索（高级，最后做）</label></li>
+        </ul>
+
+        <h2 data-phase="phase3">Phase 3：多模态推理（差异化卖点） <span class="progress" data-progress-for="phase3"></span></h2>
+
+        <p>
+          这是整个 roadmap 的差异化部分：纯 LLM 加速的人多，但能把 toolkit 已有的 vision encoder 和新加的 LLM 拼起来做高性能多模态推理的人少。
+        </p>
+
+        <ul class="todo" data-phase-group="phase3">
+          <li><input type="checkbox" id="p3-1"><label for="p3-1">调研 Qwen2-VL-2B 和 LLaVA-1.5-7B 的架构、ONNX 导出可行性</label></li>
+          <li><input type="checkbox" id="p3-2"><label for="p3-2">复用 toolkit 现有 ViT / CLIP encoder，对接到 LLM 模块的 embedding 输入</label></li>
+          <li><input type="checkbox" id="p3-3"><label for="p3-3">实现一个具体多模态模型的端到端推理（首选 Qwen2-VL-2B）</label></li>
+          <li><input type="checkbox" id="p3-4"><label for="p3-4">benchmark：3080 Ti 上的 image + text → text 端到端延迟，对比 HF transformers baseline</label></li>
+          <li><input type="checkbox" id="p3-5"><label for="p3-5">写多模态推理的设计博客（这一篇预期是整个系列里 traction 最高的）</label></li>
+        </ul>
+
+        <h2>风险 / 失败模式</h2>
+
+        <ul>
+          <li><strong>心理上：4 周后觉得太慢就放弃</strong>。预期对齐到 3-6 个月才合理；如果第 4 周开始焦虑，回头看本表的进度而不是看绝对时间</li>
+          <li><strong>技术上：ONNX 导出 LLM 卡 1-2 周</strong>。这是已知的坑，单独排过程做成一篇博客，把"踩坑"本身当成产出</li>
+          <li><strong>协作上：owner 拒绝方向</strong>。Phase 0 的 RFC 必不可少，不要默默写完一个月才提交</li>
+          <li><strong>范围漂移：开始想做 vLLM 平替</strong>。每周回头读一遍"不在范围内"那一节</li>
+          <li><strong>第一个 PR 被晾着</strong>。如果 PR1 提交后两周没反馈，礼貌地在 issue 里 ping，再不行就把 PR1-3 一起提交，一次性给 maintainer 评估</li>
+        </ul>
+
+        <h2>计划写的博客系列（每篇都是一次承诺）</h2>
+
+        <ul class="todo" data-phase-group="blogs">
+          <li><input type="checkbox" id="b-0" checked disabled><label for="b-0">本篇：路线 + 待办（这一篇）</label></li>
+          <li><input type="checkbox" id="b-1"><label for="b-1">读 llama2.c：KV cache 内存布局可视化</label></li>
+          <li><input type="checkbox" id="b-2"><label for="b-2">两周探针结果：我到底懂不懂 LLM 推理</label></li>
+          <li><input type="checkbox" id="b-3"><label for="b-3">C++ 里实现 GPT2-style BPE：运行时加载 vocab 的工程细节</label></li>
+          <li><input type="checkbox" id="b-4"><label for="b-4">ONNX 导出 LLM 模型：past_key_values 的踩坑实录</label></li>
+          <li><input type="checkbox" id="b-5"><label for="b-5">KVCacheBuffer 设计：从基类接口到 device memory 布局</label></li>
+          <li><input type="checkbox" id="b-6"><label for="b-6">Qwen2.5-0.5B 在 3080 Ti 上的第一份 benchmark</label></li>
+          <li><input type="checkbox" id="b-7"><label for="b-7">CUDA Graph 给 decode 阶段提速：实测数据</label></li>
+          <li><input type="checkbox" id="b-8"><label for="b-8">INT8 weight-only 量化：精度损失 vs 速度提升</label></li>
+          <li><input type="checkbox" id="b-9"><label for="b-9">多模态推理服务化：把 vision encoder 和 LLM 缝起来的工程</label></li>
+        </ul>
+
+        <button class="reset-btn" id="reset-todo">重置所有勾选</button>
+
+        <script>
+          (function () {
+            var STORAGE_KEY = 'lite-llm-roadmap-v1';
+            var state = {};
+            try {
+              state = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+            } catch (e) {
+              state = {};
+            }
+
+            var checkboxes = document.querySelectorAll('ul.todo input[type="checkbox"]:not([disabled])');
+            checkboxes.forEach(function (cb) {
+              if (state[cb.id]) cb.checked = true;
+              cb.addEventListener('change', function () {
+                state[cb.id] = cb.checked;
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+                updateProgress();
+              });
+            });
+
+            function updateProgress() {
+              var groups = document.querySelectorAll('[data-phase-group]');
+              var aggregateByPhase = {};
+
+              groups.forEach(function (group) {
+                var name = group.dataset.phaseGroup;
+                var checks = group.querySelectorAll('input[type="checkbox"]');
+                var done = 0;
+                checks.forEach(function (c) { if (c.checked) done++; });
+                aggregateByPhase[name] = { done: done, total: checks.length };
+              });
+
+              document.querySelectorAll('[data-progress-for]').forEach(function (span) {
+                var key = span.dataset.progressFor;
+                var sum = { done: 0, total: 0 };
+                Object.keys(aggregateByPhase).forEach(function (k) {
+                  if (k === key || k.indexOf(key + '-') === 0) {
+                    sum.done += aggregateByPhase[k].done;
+                    sum.total += aggregateByPhase[k].total;
+                  }
+                });
+                if (sum.total > 0) {
+                  span.textContent = sum.done + ' / ' + sum.total;
+                }
+              });
+            }
+
+            updateProgress();
+
+            var resetBtn = document.getElementById('reset-todo');
+            if (resetBtn) {
+              resetBtn.addEventListener('click', function () {
+                if (!confirm('确定要把所有勾选清掉吗？')) return;
+                localStorage.removeItem(STORAGE_KEY);
+                checkboxes.forEach(function (cb) { cb.checked = false; });
+                updateProgress();
+              });
+            }
+          })();
+        </script>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>A quiet blog.</p>
+    </footer>
+  </body>
+</html>
