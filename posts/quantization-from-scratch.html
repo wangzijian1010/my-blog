@@ -1,0 +1,874 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>从零开始啃量化：先跑起来，再讲清楚为什么会更快 | 慢慢写</title>
+    <meta
+      name="description"
+      content="给从没接触过量化的人写的入门：用汇率、温度计、超市货架这些日常类比讲清楚 scale / zero_point / 校准 / PTQ / QAT / Tensor Core，从动手到原理，从原理到 TensorRT 工程落地。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="从零开始啃量化：先跑起来，再讲清楚为什么会更快">
+    <meta property="og:description" content="给从没接触过量化的人写的入门：用汇率、温度计、超市货架这些日常类比讲清楚 scale / zero_point / 校准 / PTQ / QAT / Tensor Core，从动手到原理，从原理到 TensorRT 工程落地。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/quantization-from-scratch.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../archive.html">Posts</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">quantization 101</p>
+          <h1>从零开始啃量化：先跑起来，再讲清楚为什么会更快</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-11">2026.05.11</time>
+            <span>Quantization</span>
+            <span>INT8</span>
+            <span>TensorRT</span>
+            <span>PyTorch</span>
+            <span>入门</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          这篇是写给“知道量化能让模型变快，但完全没动过手”的人。顺序刻意是反的：
+          先用最小代码把一个 FP32 模型压成 INT8 跑通，再回头讲它到底在做什么、
+          为什么 GPU 真的会快、PTQ 和 QAT 区别在哪、TensorRT 里完整的工业流程长什么样。
+          每个概念后面我都会用日常生活里能想象出来的东西打个比方，再画个图，再举个具体例子。
+          看完之后你脑子里应该有一张图，而不是一堆术语。
+        </p>
+
+        <h2>一句话讲清楚量化在干嘛</h2>
+
+        <p>
+          先把整篇文章的核心放在最前面：<strong>量化的本质是用更少的比特表示同一段数值</strong>。
+          FP32 一个数占 32 位，INT8 一个数占 8 位。模型权重小 4 倍，要搬的数据少 4 倍，
+          GPU 上 INT8 的算力还比 FP32 高一大截。所以同一个模型，跑得更快、用的显存更少、
+          吞吐更大。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：你以前用一个能写 8 位小数的高级计算器（FP32），
+          每个数特别精确但占地方、算得慢。现在换成一个只能写整数 0~255 的便宜计算器（INT8）。
+          一开始你担心：哎呀，精度不够吧？但其实<strong>大部分时候你算的东西根本用不到 8 位小数</strong>——
+          比如你要算"明天大概多少温度"，30 度就够了，你不需要 30.00000312 度。
+          量化做的事就是把那些"用不到的精度"砍掉，换来速度和体积。
+        </p>
+
+        <p>
+          代价当然是有的：表达范围变窄了，从能装 ±3.4×10³⁸ 的大仓库换成只能装 -128 到 127 的小货架。
+          你必须有一套规则，把原来的浮点数<strong>合理地塞进这个小货架的 256 个格子里</strong>。
+          规则做得好，精度几乎不掉；做得不好，模型直接废。后面所有的概念，
+          基本都是在解决这同一件事：<strong>怎么把这套映射规则做好</strong>。
+        </p>
+
+        <blockquote>
+          一篇文章只要记住一句话就够：量化就是<strong>给每个 tensor 找一对 (scale, zero_point)</strong>，
+          让它在 INT8 域里能近似还原回原来的浮点数。所有概念都围绕这一对参数转。
+        </blockquote>
+
+        <h2>第一步：先把一个模型量化出来跑跑看</h2>
+
+        <p>
+          理论先放一边，咱们先动手。下面这段是 PyTorch 里最简单的动态量化（dynamic quantization），
+          适合 LSTM、Transformer 这类 Linear 层占主导的模型。
+        </p>
+
+        <pre><code>import torch
+import torch.nn as nn
+import torch.quantization as tq
+
+class TinyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(1024, 1024)
+        self.fc2 = nn.Linear(1024, 10)
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
+
+fp32_model = TinyModel().eval()
+
+int8_model = tq.quantize_dynamic(
+    fp32_model,
+    {nn.Linear},      # 只对 Linear 做量化
+    dtype=torch.qint8 # 权重压成 int8
+)
+
+x = torch.randn(1, 1024)
+y_fp32 = fp32_model(x)
+y_int8 = int8_model(x)
+
+print("max diff:", (y_fp32 - y_int8).abs().max().item())</code></pre>
+
+        <p>
+          跑完会看到两件事：第一，<code>int8_model</code> 比原来小一截；第二，输出和 FP32
+          相比只有微小误差。如果你之前完全没碰过量化，先把这段跑通比看任何公式都重要——
+          你的第一反应应该是“原来就这？”
+        </p>
+
+        <p>
+          <strong>但要泼一盆冷水</strong>：动态量化只压缩了权重，激活值在推理时还是 FP32。
+          GPU 上几乎没加速效果，只有 CPU 上的 Linear / LSTM 才真的快。
+          要在 GPU 上吃到完整加速，必须用<strong>静态量化（static quantization）</strong>——
+          权重和激活值都提前量化好，推理时全程在 INT8 域里跑。
+        </p>
+
+        <h2>第二步：静态量化最小例子（PTQ）</h2>
+
+        <p>
+          这段流程长一点，但每一步都对应后面理论里的一个概念，建议照着敲一遍：
+        </p>
+
+        <pre><code>import torch
+import torch.nn as nn
+import torch.quantization as tq
+
+class ConvNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.quant   = tq.QuantStub()    # FP32 → INT8 的入口
+        self.conv    = nn.Conv2d(3, 16, 3, padding=1)
+        self.relu    = nn.ReLU()
+        self.pool    = nn.AdaptiveAvgPool2d(1)
+        self.fc      = nn.Linear(16, 10)
+        self.dequant = tq.DeQuantStub()  # INT8 → FP32 的出口
+    def forward(self, x):
+        x = self.quant(x)
+        x = self.relu(self.conv(x))
+        x = self.pool(x).flatten(1)
+        x = self.fc(x)
+        return self.dequant(x)
+
+model = ConvNet().eval()
+
+# 1. 选量化方案：x86 服务端用 fbgemm，ARM 用 qnnpack
+model.qconfig = tq.get_default_qconfig("fbgemm")
+
+# 2. 插入观察器（observer），在校准时记录每个 tensor 的 min/max
+tq.prepare(model, inplace=True)
+
+# 3. 喂校准集，让 observer 看到真实激活分布
+with torch.no_grad():
+    for _ in range(50):
+        model(torch.randn(8, 3, 32, 32))
+
+# 4. 把 observer 记到的统计量转换成 scale / zero_point，得到 INT8 模型
+tq.convert(model, inplace=True)</code></pre>
+
+        <p>
+          打印出来你会看到 <code>Conv2d</code> 变成了 <code>QuantizedConv2d</code>，模型里多出
+          <code>Quantize</code> 和 <code>Dequantize</code> 节点。这就是静态量化的完整形态：
+          <strong>边界处插 Quant / Dequant，中间全程 INT8</strong>。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：你可以把这个流程想成<strong>海关换汇</strong>。
+          数据进国（QuantStub）时把 FP32 换成 INT8，在国内（GPU 里）一直用 INT8 流通，
+          出国（DeQuantStub）时再换回 FP32。中间一直是 INT8，所以省钱（省显存）、办事快（算得快）。
+        </p>
+
+        <pre><code>     输入 FP32                        输出 FP32
+        │                                  ↑
+        ▼                                  │
+   ┌─────────┐                         ┌────────┐
+   │ Quant   │  ← 海关：FP32 → INT8     │DeQuant │  ← 海关：INT8 → FP32
+   └─────────┘                         └────────┘
+        │                                  ↑
+        ▼                                  │
+   ┌─────────┐    ┌─────────┐    ┌──────────────┐
+   │ Conv8   │ →  │ ReLU8   │ →  │ Linear8      │   ← 国内：全程 INT8
+   └─────────┘    └─────────┘    └──────────────┘</code></pre>
+
+        <p>
+          特别注意 <code>prepare</code> 和 <code>convert</code> 之间那 50 步推理。
+          这就是“校准（calibration）”——拿一批有代表性的数据喂进去，让 observer 看清楚
+          每个激活值<strong>真实分布的范围</strong>。
+          这一步如果跳过，scale / zero_point 都是空的，模型转换后直接报错或输出乱码。
+        </p>
+
+        <blockquote>
+          PTQ（post-training quantization，训练后量化）就是这套流程：模型不重训，
+          只多跑一次校准。代价低、上手快，工程里 80% 的场景首选这个。
+          剩下 20% 精度掉得太多的，再考虑 QAT。
+        </blockquote>
+
+        <h2>到底发生了什么：scale 和 zero_point</h2>
+
+        <p>
+          上面代码跑完，你已经把量化用过一遍了。现在来看里面发生了什么。
+          整个量化只有一对参数：<strong>scale（缩放系数）</strong>和<strong>zero_point（零点偏移）</strong>，
+          公式是：
+        </p>
+
+        <pre><code>q = round(x / scale) + zero_point         (FP32 → INT8)
+x ≈ (q - zero_point) * scale              (INT8 → FP32)</code></pre>
+
+        <p>
+          光看公式没什么感觉。<strong>打个比方</strong>：scale 和 zero_point 就是<strong>汇率</strong>。
+          1 美元换 7.2 人民币，"7.2" 就是 scale——你只要知道这个数，就能在两种货币之间换算。
+          那 zero_point 是什么？想想<strong>摄氏度和华氏度</strong>——0°C 不是 0°F，而是 32°F，
+          所以转换公式是 F = C × 1.8 + 32。这里 1.8 是 scale，32 就是 zero_point。
+          量化做的事一模一样：把 FP32 这套"货币"换算成 INT8 这套"货币"，需要一对 (scale, zero_point)。
+        </p>
+
+        <h3>举个具体例子</h3>
+
+        <p>
+          假设某层激活值在校准集上看到的真实分布是 [-2.0, 6.0]。
+          INT8 可以表示 [-128, 127] 一共 256 个整数。
+          量化要做的，就是<strong>把 [-2.0, 6.0] 这段连续的浮点区间，均匀切成 256 份，
+          每份对应一个 INT8 编号</strong>。
+        </p>
+
+        <pre><code>FP32 世界:    -2.0 ─────────── 0.0 ─────────── 6.0
+               │                 │                │
+               │ 把这 8.0 的范围  │                │
+               │ 切成 255 等份    │                │
+               ▼                 ▼                ▼
+INT8 世界:    -128 ───────────  -64 ─────────── 127
+
+scale       = (6.0 - (-2.0)) / (127 - (-128)) = 8.0 / 255 ≈ 0.0314
+                ↑ 每个 INT8 格子代表 0.0314 个浮点单位
+
+zero_point  = round(-128 - (-2.0) / 0.0314)    = -64
+                ↑ FP32 的 0.0 落在 INT8 哪个编号上</code></pre>
+
+        <p>
+          有了 (scale=0.0314, zero_point=-64) 这一对参数，
+          FP32 的 1.5 会被映射成 INT8 的 -16：
+        </p>
+
+        <pre><code>q = round(1.5 / 0.0314) + (-64) = round(47.77) - 64 = 48 - 64 = -16
+
+# 反过来还原 -16：
+x ≈ (-16 - (-64)) * 0.0314 = 48 * 0.0314 ≈ 1.507
+
+# 原始是 1.5，量化往返后是 1.507，误差 0.007</code></pre>
+
+        <p>
+          这个 0.007 就是<strong>量化误差</strong>。它不是 bug，是这套压缩方式的根本代价。
+          想象你拿一个只能写整数厘米的尺子去量身高，本来 175.3cm 的人，
+          你只能记成 175cm。少了 0.3cm 不是尺子坏了，是它精度就这样。
+          整个量化领域大半的工程经验，都在讨论<strong>怎么让这个误差均匀分布、
+          不被异常值搞砸</strong>。
+        </p>
+
+        <h3>对称量化 vs 非对称量化</h3>
+
+        <p>
+          上面例子里 zero_point = -64，不为 0，这是<strong>非对称量化</strong>。
+          如果强行让 zero_point = 0，就是<strong>对称量化</strong>：
+        </p>
+
+        <pre><code>scale = max(|x_min|, |x_max|) / 127
+q     = round(x / scale)
+x     ≈ q * scale</code></pre>
+
+        <p>
+          <strong>打个比方</strong>：
+        </p>
+
+        <ul>
+          <li><strong>对称量化</strong>就像<strong>直尺</strong>——0 刻度在正中间，左右对称分布。</li>
+          <li><strong>非对称量化</strong>就像<strong>温度计</strong>——0 不在中间，可以根据实际情况偏一侧。</li>
+        </ul>
+
+        <pre><code>对称：       -128 ─────── 0 ─────── 127      ← 零点固定在中间
+                          ↑
+                       zero_point = 0
+
+非对称：     -128 ───── -64 ─────── 127      ← 零点可以挪到任何位置
+                          ↑
+                       zero_point 任意</code></pre>
+
+        <p>
+          对称量化好处是：反量化只剩一次乘法，没加法，硬件实现快。
+          缺点是：<strong>如果数据偏向一侧（比如 ReLU 之后激活全是非负）</strong>，
+          那 INT8 的负数区间全浪费了，相当于只用了 128 个格子。
+        </p>
+
+        <pre><code>ReLU 之后的真实激活分布:
+0 ────────────────────────────────── 10
+│■■■■■■■■■■■■■■■■■■■■■■■■■■│            (数据集中在 [0, 10])
+
+如果用对称量化：
+-127 ─────────────── 0 ────────── 127
+│ 这一半完全用不到 │  ■■■■■■■■■■■  │   ← 浪费一半格子！
+
+如果用非对称量化：
+-128 ──────────────────────────── 127
+│ ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ │   ← 256 格全用上</code></pre>
+
+        <p>
+          所以实战里有个常见组合：<strong>权重用对称（分布以 0 为中心，天生对称），
+          激活值用非对称（经常偏一侧，需要灵活）</strong>。这也是 TensorRT 默认的做法。
+        </p>
+
+        <h3>per-tensor vs per-channel</h3>
+
+        <p>
+          下一个要分清的概念：一对 (scale, zero_point) 是给整个 tensor 用，
+          还是给每个 channel 单独算一对？
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：你管一个班，要给所有学生制定一个评分规则。
+        </p>
+
+        <ul>
+          <li><strong>per-tensor</strong>：全班用一个统一的"百分制"。
+              简单，但有的人天生学霸（数值大），有的人天生及格线徘徊（数值小），
+              统一规则下，及格线那帮人只能被挤到 50~60 这一小段，分辨率很差。</li>
+          <li><strong>per-channel</strong>：<strong>每个人有一份单独的评分曲线</strong>。
+              学霸用 90~100 的精细刻度，及格生用 40~60 的精细刻度，互不干扰。</li>
+        </ul>
+
+        <pre><code>某 Conv 的 64 个输出 channel，各自的数值范围：
+
+channel 0:  [-0.5, 0.5]
+channel 1:  [-0.3, 0.4]
+...
+channel 63: [-10, 10]      ← 离群分布，数值范围大得多
+
+per-tensor：所有 channel 共用一个 scale，被 channel 63 拖累
+  scale = 10 / 127 ≈ 0.0787
+  channel 0 的 [-0.5, 0.5] 只能用到 INT8 里的 [-6, +6]
+  → 13 个格子，分辨率惨不忍睹
+
+per-channel：每个 channel 一个 scale
+  channel 0:  scale = 0.5 / 127 ≈ 0.00394，用满 256 格
+  channel 63: scale = 10 / 127 ≈ 0.0787，用满 256 格
+  → 每个 channel 都用满 256 格，分辨率最大化</code></pre>
+
+        <blockquote>
+          实战经验：<strong>权重用 per-channel，激活用 per-tensor</strong>。
+          权重是静态的，算一次就行；激活是动态的，per-channel 会在 GEMM 前
+          多出一堆反量化，划不来。这套组合是 TensorRT 默认配置，闭着眼用就行。
+        </blockquote>
+
+        <h2>校准：模型精度的命门</h2>
+
+        <p>
+          前面那段 PTQ 代码里有一行 <code>for _ in range(50): model(torch.randn(...))</code>，
+          看起来不起眼。但<strong>整个 PTQ 流程里精度掉不掉，几乎全在这一步决定</strong>。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：校准就像<strong>装修前测尺寸</strong>。
+          你不知道家具会摆在哪，就先在墙上量几个点；点量得准，柜子做出来贴合；
+          点量错了，柜子做出来要么塞不进，要么晃荡。
+          量化的 scale / zero_point 就是基于校准时看到的数值范围算出来的，
+          如果校准集没看到真实部署时会出现的数据，scale 就会算偏，
+          线上精度就崩。
+        </p>
+
+        <h3>校准集怎么选（极其重要）</h3>
+
+        <pre><code>1. 数量：通常 100 ~ 1000 张就够，再多收益很小
+2. 分布：必须覆盖线上推理会遇到的所有 domain
+   - 检测模型：白天 / 夜间 / 室内 / 室外 / 不同摄像头
+   - 分类模型：所有类别都要有
+   - OCR：所有字体 / 语言 / 倾斜角度
+3. 不要用训练集！（很多新人都会犯）
+   要用验证集或线上真实采样数据，分布更接近部署场景</code></pre>
+
+        <p>
+          <strong>一个真实翻车案例</strong>：某检测模型校准时只用了白天的图片，
+          上线后白天 mAP 76.5，半夜 mAP 突然掉到 68。查了半天，
+          原来夜间画面的某些低照度激活值远超校准时看到的范围，
+          量化误差暴增。后来把夜间图片加进校准集，问题立刻消失。
+          这种 bug 在 FP32 / FP16 模型上根本不会出现，是<strong>量化独有的工程问题</strong>。
+        </p>
+
+        <h3>校准方法：MinMax、Percentile、Entropy</h3>
+
+        <p>
+          有了校准集，下一步是<strong>从这一堆激活值里挑出 scale</strong>。
+          这里有三种主流方法，先用比喻讲清楚再说细节。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：你要给班里所有人设计校服尺寸，但只能做 256 个尺码。
+        </p>
+
+        <ul>
+          <li><strong>MinMax</strong>：找全班最矮和最高的两个人，
+              然后中间均分 256 档。<strong>问题：如果班里有个 2.1 米的篮球队员，
+              其他人都在 1.6~1.8</strong>，那 1.6~1.8 这段挤进很少几档，
+              大部分人穿的尺码区分不开。</li>
+          <li><strong>Percentile</strong>：<strong>不管最高最矮，直接砍掉前后 1%</strong>。
+              那个 2.1 米的篮球队员不要了，按 1.6~1.85 均分 256 档。
+              代价是篮球队员的衣服会偏小，但其他 99% 的人衣服更合身。</li>
+          <li><strong>Entropy / KL 散度</strong>：<strong>让量化前后的"分布形状"尽可能相似</strong>。
+              这是 TensorRT 默认用的，相对最聪明，但也最难解释直觉。</li>
+        </ul>
+
+        <pre><code>原始激活分布（FP32）：
+   ▁▁▁▂▃▅█████████▅▃▂▁▁▁         ← 大部分集中在中间
+   │                       │
+  -10                      +10
+                              偶尔有一个 outlier 在 +50
+
+MinMax 量化：
+   scale = 50 / 127，主要分布被挤到 INT8 [-25, +25] 这一小段
+   ▁▂█▅▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁         ← 分辨率烂
+
+Percentile (99.99%)：
+   scale 按 +10 算，outlier 被 clip 到 127
+   ▁▁▁▂▃▅█████████▅▃▂▁▁▁         ← 几乎和原始一样
+
+Entropy：
+   挑一个让"量化前后分布最像"的 clip 阈值
+   通常和 Percentile 接近，但更稳健</code></pre>
+
+        <p>
+          排查顺序很简单：
+          <strong>MinMax 不行就 Percentile，Percentile 不行就 Entropy，Entropy 也不行就上 QAT</strong>。
+        </p>
+
+        <h2>PTQ 不行就 QAT：量化感知训练</h2>
+
+        <p>
+          PTQ 简单粗暴，但有些模型就是会掉得离谱——典型的有 MobileNet 这种本来就压缩过的小模型、
+          检测模型的 head 部分、Transformer 里的 LayerNorm 后面。这时候要请出 QAT
+          （quantization-aware training，量化感知训练）。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：
+        </p>
+
+        <ul>
+          <li><strong>PTQ</strong>就像<strong>毕业后才知道要考公务员</strong>，
+              所有知识都用大学学的硬上场考试。能过就过，不能过就掉点。</li>
+          <li><strong>QAT</strong>就像<strong>从大三就开始按公务员考试方向准备</strong>，
+              所有学习都是冲着这个考试设计的。当然成绩更好。</li>
+        </ul>
+
+        <p>
+          技术上，QAT 在<strong>训练阶段</strong>就插入"伪量化（fake quant）"节点，
+          告诉模型："你以后是要被量化的，权重和激活提前调整成量化友好的样子"：
+        </p>
+
+        <pre><code>训练时的前向：
+x_fp32 ──[fake_quant: quant → dequant]──> x' ──> next layer
+
+# fake_quant 干了什么：
+#   q  = round(x / scale) + zero_point    # FP32 → INT8（模拟量化）
+#   x' = (q - zero_point) * scale          # INT8 → FP32（但已损失精度）
+# 返回 x'，下一层用 x' 继续算
+
+→ 模型在训练时就感受到了"量化误差"，loss 会自动把权重调到更鲁棒的位置</code></pre>
+
+        <p>
+          这里有个数学上的小坎：<code>round</code> 不可导，反向传播会断梯度。
+          QAT 用 <strong>STE（Straight-Through Estimator）</strong>绕过——
+          反向时直接假装 round 是恒等映射，梯度照穿。
+        </p>
+
+        <p>
+          <strong>STE 打个比方</strong>：上课时老师问"这道题的过程怎么算？"——
+          数学上严格说不出来（不可导），但你<strong>装作自己懂了，直接抄答案给学生</strong>。
+          神奇的是工程上效果很好。深度学习里很多看起来粗糙的 trick 都是这种风格。
+        </p>
+
+        <blockquote>
+          实战决策树：PTQ 跑一遍 → 精度能接受就上线；不能接受 → 换校准方法 / per-channel /
+          敏感层不量化；还不行 → QAT。<strong>不要跳过 PTQ 直接 QAT</strong>——
+          你不知道问题在哪，可能换个校准方法就解决了，犯不着重训。
+        </blockquote>
+
+        <h2>为什么 INT8 真的会更快：硬件视角</h2>
+
+        <p>
+          到这里量化的"做法"讲完了，但还有最关键的一个问题：
+          <strong>同一个矩阵乘法，为什么 INT8 比 FP32 快</strong>？
+          这个问题答不清楚，面试官追问时只能背 PPT。
+        </p>
+
+        <h3>原因一：算力差距（Tensor Core）</h3>
+
+        <p>
+          现代 NVIDIA GPU（Volta 之后）有专门的<strong>Tensor Core</strong>单元，
+          是为矩阵乘累加（MMA）优化的硬件电路。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：你以前拧螺丝用<strong>手动螺丝刀</strong>（CUDA Core），
+          每次一颗，FP32 / FP16 / INT8 都能拧。
+          现在多了一把<strong>电动螺丝刀</strong>（Tensor Core），
+          一秒钟能拧好几颗，<strong>但只能拧固定规格</strong>——FP16、BF16、INT8、INT4。
+          想用电动螺丝刀的快，就得换成它认的规格。所以 INT8 才能吃满 Tensor Core 算力。
+        </p>
+
+        <p>
+          以 A100 为例：
+        </p>
+
+        <pre><code>FP32  (CUDA Core):     19.5  TFLOPS     ← 手动螺丝刀，慢
+TF32  (Tensor Core):   156   TFLOPS     ← 电动 8 倍
+FP16  (Tensor Core):   312   TFLOPS     ← 电动 16 倍
+INT8  (Tensor Core):   624   TOPS       ← 电动 32 倍
+INT4  (Tensor Core):  1248   TOPS       ← 电动 64 倍
+
+INT8 比 FP32 标称 32 倍快，比 FP16 还快 2 倍</code></pre>
+
+        <p>
+          实际跑模型大概能拿到 30%~60% 的利用率，但即使打折，
+          <strong>INT8 相比 FP16 通常还有 1.5~1.8 倍加速</strong>。
+          所以就算 FP16 已经够快，生产环境还是会进一步压 INT8。
+        </p>
+
+        <h3>原因二：显存带宽（更关键）</h3>
+
+        <p>
+          很多人以为 INT8 快是因为"算得快"，但在小 batch 推理下，
+          其实是<strong>显存带宽更关键</strong>。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：GPU 算东西像<strong>厨师做菜</strong>。
+          算力（Tensor Core）是厨师有几只手——FP32 是 1 只手，INT8 是 32 只手。
+          但厨师做菜还得有人<strong>从冰箱搬食材到灶台</strong>（显存带宽）。
+          如果搬食材的人比厨师慢，厨师 32 只手都闲着没用。
+        </p>
+
+        <pre><code>FP32 一个数  = 4 字节       INT8 一个数  = 1 字节
+                                        ↓
+                          同样带宽下，INT8 能搬 4 倍的数据
+                              或者反过来，搬同样数据耗时 1/4
+
+GPU 时间线（搬运 vs 计算）：
+
+FP32 推理：
+搬运：████████████        ← 慢，搬不动
+计算：    ██              ← 快，但等搬运
+                            算力闲着 80%
+
+INT8 推理：
+搬运：███                  ← 快
+计算：    ████             ← 计算成了瓶颈，但本来就该这样
+                            算力打满</code></pre>
+
+        <p>
+          这就解释了一个反直觉的现象：有时候 INT8 比 FP16 还快 2 倍以上，
+          是因为它<strong>同时吃到了算力 +1 倍和带宽 +1 倍</strong>。
+        </p>
+
+        <h3>原因三：Cache 友好 + 算子融合</h3>
+
+        <p>
+          INT8 数据小，<strong>L1/L2 cache 能装下更多 tile</strong>，
+          每个 SM 上能同时跑的 warp 更多。简单说就是<strong>厨房工作台变大了</strong>，
+          摆开更多食材一起处理。
+        </p>
+
+        <p>
+          另外，<strong>INT8 后端经常自带算子融合</strong>。
+          TensorRT 会把 Conv + Bias + ReLU 融成一个 INT8 fused kernel，
+          中间不落显存。FP32 同样的链路如果没人手写 plugin，
+          要分三个 kernel 跑，多两次中转。
+        </p>
+
+        <blockquote>
+          面试官问"INT8 为什么快"，<strong>四个原因都要说</strong>：
+          算力高、带宽省、cache 友好、自动融合。只说一个 Tensor Core，
+          会被看出来只背了一层。
+        </blockquote>
+
+        <h2>TensorRT INT8 工业流程</h2>
+
+        <p>
+          PyTorch 的量化主要在 CPU 上用，GPU 生产部署基本都走 TensorRT。
+          完整流程长这样：
+        </p>
+
+        <pre><code>1. PyTorch FP32 模型
+   ↓ torch.onnx.export()
+2. ONNX 模型 (FP32)
+   ↓ trtexec / TensorRT Python API
+3. TensorRT engine 构建
+   - 设置 builder.int8_mode = True
+   - 传入 IInt8Calibrator（喂校准集）
+   - TensorRT 内部做 Entropy 校准 + 算子融合 + kernel 选择
+   ↓
+4. INT8 engine (.plan / .engine)
+   ↓ 加载到 IExecutionContext
+5. 在线推理（输入仍是 FP32 / FP16，引擎内部做 quant / dequant）</code></pre>
+
+        <p>
+          关键代码（简化版）：
+        </p>
+
+        <pre><code>import tensorrt as trt
+import pycuda.driver as cuda
+
+class MyCalibrator(trt.IInt8EntropyCalibrator2):
+    def __init__(self, calib_loader, cache_file):
+        super().__init__()
+        self.loader = iter(calib_loader)
+        self.cache_file = cache_file
+        self.device_input = cuda.mem_alloc(...)  # 预分配 GPU 输入 buffer
+
+    def get_batch_size(self):
+        return 8
+
+    def get_batch(self, names):
+        try:
+            batch = next(self.loader)            # 拿一个 batch 的校准图
+            cuda.memcpy_htod(self.device_input, batch.ravel())
+            return [int(self.device_input)]
+        except StopIteration:
+            return None
+
+    def read_calibration_cache(self):
+        if os.path.exists(self.cache_file):
+            return open(self.cache_file, "rb").read()
+
+    def write_calibration_cache(self, cache):
+        open(self.cache_file, "wb").write(cache)
+
+builder = trt.Builder(TRT_LOGGER)
+config  = builder.create_builder_config()
+config.set_flag(trt.BuilderFlag.INT8)
+config.int8_calibrator = MyCalibrator(calib_loader, "calib.cache")
+config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)
+
+network = builder.create_network(...)
+parser  = trt.OnnxParser(network, TRT_LOGGER)
+parser.parse(open("model.onnx", "rb").read())
+
+engine = builder.build_serialized_network(network, config)
+open("model_int8.engine", "wb").write(engine)</code></pre>
+
+        <h3>几个工程上必须知道的小细节</h3>
+
+        <p>
+          <strong>calibration cache</strong>：第一次校准要跑几十秒到几分钟，
+          TensorRT 会把算出来的 scale 写到 cache 文件。下次重新构建 engine 时，
+          只要 cache 在，不用重新跑校准集，构建快很多。
+          <strong>打个比方</strong>：就像装修测过一次尺寸后，把尺寸记在本子上，
+          下次装修再用同一套尺寸，不用重测。
+        </p>
+
+        <p>
+          <strong>同时开 FP16 + INT8</strong>：很多人不知道这俩可以一起开。
+          这样 TensorRT 在构建时会<strong>自动给每一层挑最优精度</strong>——
+          敏感层（比如最后的分类头）回退到 FP16，其他走 INT8。
+          实测<strong>这种混合精度往往比纯 INT8 精度更好，速度只慢一点</strong>，是最佳实践。
+        </p>
+
+        <p>
+          <strong>第一层和最后一层不量化</strong>：实战里非常常用的 trick。
+          第一层（接原始输入）和最后一层（输出 logits）数值分布最不规整，
+          对精度影响最大。TensorRT 没有直接 API，需要手动设
+          <code>set_precision(trt.float16)</code>。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：做饭时<strong>第一刀和最后一刀讲究多</strong>——
+          第一刀决定整道菜的结构（输入），最后一刀决定上桌的样子（输出），
+          中间的切丁切丝可以糙一点。量化里也是这个道理：边界层保留高精度，
+          中间层放心压。
+        </p>
+
+        <h2>掉点了怎么办：精度回归排查</h2>
+
+        <p>
+          新手不是被"怎么转 INT8"卡住，而是被"转完精度掉了，下一步该查啥"卡住。
+          下面这套排查顺序是实战里几乎每次都用得到的：
+        </p>
+
+        <pre><code>第 0 步：确认掉的是哪种精度
+        分类 → top-1/top-5；检测 → mAP；分割 → mIoU；LLM → PPL
+        不要只看 tensor 的 cosine similarity，业务指标才作数
+
+第 1 步：对比 FP32 / FP16 / INT8 三个版本
+        如果 FP16 也掉，那不是量化问题（模型对低精度敏感）
+        只有 INT8 掉，才是校准问题
+
+第 2 步：换校准方法 + 加大校准集
+        Entropy 不行换 Percentile (99.99/99.999)
+        校准集 100 张加到 1000 张，覆盖更多场景
+        ← 这步能救回大约一半的掉点案例
+
+第 3 步：per-tensor 改 per-channel
+        TensorRT 8.0+ 默认开了，老版本要手动开
+
+第 4 步：sensitivity analysis（敏感性分析）← 最实用
+        每次只量化一层，其他保持 FP16，看精度掉多少
+        排序，找出最敏感的 top-5 层，强制保留 FP16
+        → 一般做完这步，精度能回来 90%
+
+第 5 步：上 QAT
+        前面四步都不行，再考虑重训</code></pre>
+
+        <p>
+          <strong>敏感性分析的代码长这样</strong>，简单但实战中救命：
+        </p>
+
+        <pre><code>for layer in model.layers:
+    # 默认全 FP16
+    set_all_layers_precision(model, fp16=True)
+    # 单独让这一层走 INT8
+    set_layer_precision(layer, int8=True)
+    accuracy = evaluate(build_engine(model), val_loader)
+    print(layer.name, accuracy)
+
+# 输出大概长这样：
+# layer_0  (conv_1):       72.3   ← 掉了 4 个点，敏感！
+# layer_1  (conv_2):       76.1   ← 几乎不掉
+# layer_2  (bn_1):         76.0
+# ...
+# layer_last (classifier): 73.5   ← 也敏感
+#
+# 结论：layer_0 和 layer_last 保留 FP16，其他走 INT8</code></pre>
+
+        <h2>常见坑：新手必踩</h2>
+
+        <h3>1. 校准集用了训练集</h3>
+
+        <p>
+          训练集做了大量增强（color jitter、随机裁剪、mixup），分布和真实部署数据已经差很远。
+          用它做校准会让 scale 偏大，浪费 INT8 编码空间。
+          <strong>正确做法：用验证集，或线上采样的真实数据</strong>。
+        </p>
+
+        <h3>2. BN 没融合就量化</h3>
+
+        <p>
+          BatchNorm 在推理时是个仿射变换（<code>y = γ * (x - μ) / σ + β</code>），
+          可以直接吸进前面的 Conv（BN folding）。
+          <strong>如果 BN 没融合就量化，会多出一个 BN 算子要量化，精度更难保证</strong>。
+          所有工具链都会自动 fold，但前提是导出 ONNX 时模型在 <code>eval()</code> 模式。
+          这个坑无数人踩过：忘了 <code>model.eval()</code> 就 export。
+        </p>
+
+        <h3>3. ResNet 的 Add 两个分支 scale 不一样</h3>
+
+        <p>
+          ResNet 这种带 skip connection 的结构，Add 之前两个分支的 INT8 tensor 各有自己的 scale。
+          <strong>scale 不一样的 INT8 直接相加结果是错的</strong>——
+          就像一个是厘米一个是英寸，不能直接加。
+          TensorRT 会自动加 requantize 节点统一 scale，但开销比 FP16 直接加大很多。
+        </p>
+
+        <h3>4. 动态 shape 下校准只用一种尺寸</h3>
+
+        <p>
+          检测模型经常支持多尺度（640/800/1280），<strong>校准集必须覆盖所有尺寸</strong>，
+          否则换一个尺寸推理时激活分布超出校准范围，精度可能崩。
+        </p>
+
+        <h3>5. CUDA / TensorRT 版本和 cache 绑定</h3>
+
+        <p>
+          升级 TensorRT 后第一次构建会很慢，<strong>不要怀疑环境出问题，是 cache 在重算</strong>。
+        </p>
+
+        <h2>回到理论：为什么是 INT8，不是 INT4 / INT2</h2>
+
+        <p>
+          INT8 不是唯一选择，业内也在用 INT4、二值化（INT1）。但 INT8 之所以是"甜点"，
+          是它在<strong>动态范围、精度损失、硬件支持</strong>三者之间平衡得最好。
+        </p>
+
+        <pre><code>数据类型对比：
+
+FP32: 范围 ±3.4e38     精度极高    算力低    体积大
+FP16: 范围 ±6.5e4      精度高      算力高    体积中
+BF16: 范围 ±3.4e38     精度中      算力高    体积中  (LLM 训练首选)
+INT8: 范围 ±128        精度够用    算力高    体积小  (CV 部署首选)
+INT4: 范围 ±8          精度勉强    算力更高  体积更小 (LLM 部署首选)</code></pre>
+
+        <p>
+          <strong>打个比方</strong>：FP32 像<strong>瑞士手表</strong>，
+          精确到毫秒，但又大又贵；INT8 像<strong>电子表</strong>，
+          精确到秒，对大部分场景够用；INT4 像<strong>看太阳判断时间</strong>，
+          只够"大概上午下午"——某些场景能凑合，但精度太低。
+        </p>
+
+        <p>
+          CV 模型一般 INT8 就够，INT4 经常掉 2~5 个点要复杂 QAT 才能救。
+          LLM 是个例外——大模型参数冗余多，INT4 / INT3 都能保持几乎不掉点，
+          所以大模型量化（GPTQ、AWQ、SmoothQuant）反而是 INT4 为主。
+          这是另一个完整领域，不在这篇范围里。
+        </p>
+
+        <h2>面试时怎么讲量化项目</h2>
+
+        <p>
+          如果简历写了"做过 INT8 量化"，面试一定被追问。下面这套是高级工程师的标准回答框架：
+        </p>
+
+        <pre><code>1. 背景：什么模型 + 什么环境 + 为什么要量化
+   ✓ "检测模型 FP16 下 8ms，业务要 4ms 以内"
+   ✗ "我用 TensorRT 做了 INT8"   ← 没说为什么
+
+2. 选型：PTQ 还是 QAT，为什么
+   ✓ "先试 PTQ，500 张线上图，Entropy 校准，掉 1.2 个 mAP，可接受"
+   ✗ "我用了 PTQ"   ← 没说怎么选的
+
+3. 踩过的坑：面试官最爱听
+   ✓ "校准集第一次用训练集掉 4 个点，换验证集回到 1 个点"
+   ✓ "最后一层分类头敏感，强制 FP16 后又拉回 0.5 个点"
+   → 具体场景 + 具体数字比术语更有说服力
+
+4. 收益：三组数字
+   - 延迟：FP32 32ms → INT8 4.2ms (P50/P95/P99)
+   - 吞吐：50 QPS → 380 QPS
+   - 显存：1.2GB → 320MB
+
+5. 怎么验证（很多人忽略，但这才是体现工程素养的）
+   - 精度回归脚本
+   - A/B 测试方案
+   - 自动化对齐流程</code></pre>
+
+        <blockquote>
+          一句话总结：<strong>量化不是用魔法把模型压小，
+          而是用一对 (scale, zero_point) 在 256 个格子里复刻原本的浮点世界</strong>。
+          所有掉点问题、所有性能优化、所有面试追问，最终都回到这一对参数：
+          它们能不能精准描述这个 tensor 的真实分布？硬件能不能高效利用它们？
+        </blockquote>
+
+        <h2>接下来可以做什么</h2>
+
+        <p>
+          这篇是入门铺垫，把整张认知图拉出来了。继续深入推荐这个顺序：
+        </p>
+
+        <ol>
+          <li>动手：用 PyTorch 量化一个 ResNet18，对比 FP32 / INT8 精度</li>
+          <li>动手：用 trtexec 把同一个 ONNX 分别构建成 FP32 / FP16 / INT8 engine，比延迟和显存</li>
+          <li>读：NVIDIA 那篇 <code>8-bit Inference with TensorRT</code>（2017），理解 Entropy 校准</li>
+          <li>读：GPTQ 论文，进入 LLM 量化的世界（INT4 + group-wise quant）</li>
+          <li>读：SmoothQuant 论文，理解 activation 异常值怎么处理</li>
+          <li>挑战：自己写一个 INT8 GEMM CUDA kernel，理解硬件是怎么算的</li>
+        </ol>
+
+        <p>
+          量化的概念图就这么大，但每一个节点都能往下挖很深。
+          先把这篇文章里的核心三件事记住——
+          <strong>scale / zero_point 是核心、校准决定精度、硬件决定速度</strong>——
+          后面看任何论文、调任何 bug，都能往这个框架里塞。
+        </p>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>A quiet blog.</p>
+    </footer>
+  </body>
+</html>

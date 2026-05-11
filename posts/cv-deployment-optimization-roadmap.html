@@ -1,0 +1,879 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>拿到一个 CV pipeline，高级工程师是怎么拆解和优化的 | 慢慢写</title>
+    <meta
+      name="description"
+      content="不针对大模型，专写小模型 CV 端侧部署。从算法工程师手里接到一个 pipeline 之后，第一步该问什么、第二步该测什么、第三步该改什么，给一份能套用的优化 roadmap。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="拿到一个 CV pipeline，高级工程师是怎么拆解和优化的">
+    <meta property="og:description" content="不针对大模型，专写小模型 CV 端侧部署。从算法工程师手里接到一个 pipeline 之后，第一步该问什么、第二步该测什么、第三步该改什么，给一份能套用的优化 roadmap。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/cv-deployment-optimization-roadmap.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../archive.html">Posts</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">deployment roadmap</p>
+          <h1>拿到一个 CV pipeline，高级工程师是怎么拆解和优化的</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-11">2026.05.11</time>
+            <span>CV 部署</span>
+            <span>性能优化</span>
+            <span>方法论</span>
+            <span>TensorRT</span>
+            <span>端侧</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          算法工程师把一个 PyTorch 模型扔过来：“帮我部署一下，越快越好。”
+          这时候新手会立刻打开 ONNX、TensorRT、CUDA 开始啃；高级工程师会先<strong>放下键盘</strong>。
+          这篇写的就是“放下键盘”那段时间，脑子里到底在转什么——
+          一份能套用的优化 roadmap，不针对大模型，专写小模型 CV 端侧部署。
+        </p>
+
+        <p>
+          先把一句话原则放在前面：<strong>所有部署优化的本质，
+          是用工程手段把"模型本身"和"硬件能力"对齐</strong>。
+          中间隔着 5 道关卡——模型结构、推理引擎、数据流、调度、服务化。
+          每道关卡都有自己的瓶颈，每个瓶颈都有对应的工具。
+          但<strong>顺序不对，前面优化的收益会被后面的瓶颈吃掉</strong>，
+          就像你给一辆刹车坏的车换涡轮增压，更危险而已。
+        </p>
+
+        <h2>第一步：放下键盘，先问 4 个问题</h2>
+
+        <p>
+          算法工程师说"越快越好"，但<strong>"越快越好"不是一个工程目标</strong>，
+          只是一个愿望。真正动手前要把这句话翻译成可量化的约束。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：业主跟装修师傅说"装得漂亮点"。师傅不会马上动工，
+          他会先问：预算多少？住几个人？喜欢什么风格？什么时候要住进来？
+          这四个问题不问清楚，装出来一定不合身。部署优化是一模一样的。
+        </p>
+
+        <pre><code>问题 1：硬件是什么？
+   - 服务端 GPU（A100/4090/T4）？还是端侧（手机/Jetson/RK3588/海思）？
+   - 不同硬件能用的优化手段完全不一样
+   - 服务端可以上 TensorRT INT8，手机要看是 NPU/GPU/CPU 哪条路
+
+问题 2：业务约束是什么？
+   - 延迟优先还是吞吐优先？
+   - 业务可接受的精度损失范围？1% mAP？2%？还是必须无损？
+   - 单帧延迟必须 &lt; 33ms（30fps 实时）？还是 &lt; 100ms 就够？
+
+问题 3：当前 baseline 是什么？
+   - 原始 PyTorch 模型当前多少 ms？
+   - 内存多少？显存多少？
+   - 如果连 baseline 都没人测过，先测，再谈优化
+
+问题 4：上下游是什么？
+   - 输入从哪来？摄像头？视频文件？上游模型的输出？
+   - 输出去哪？显示？保存？喂给下游模型？
+   - 这决定了前后处理能不能省、能不能合并</code></pre>
+
+        <p>
+          <strong>第一步真正学到的是</strong>：优化不是"看到模型就上 TensorRT"，
+          而是<strong>用业务约束反推技术选型</strong>。
+          比如手机端，TensorRT 根本没法用，得走 MNN / NCNN / CoreML；
+          比如要无损精度，INT8 直接被否，老老实实跑 FP16。
+          这一步省下的时间，比后面任何一项优化都多。
+        </p>
+
+        <h2>第二步：测量，永远先测量</h2>
+
+        <p>
+          四个问题问完，第二件事不是改代码，是<strong>把现状测清楚</strong>。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：医生看病不会直接开刀，先要量血压、抽血、拍 CT。
+          量化指标决定了下一步动哪里。部署优化里这个"CT"就是
+          <strong>端到端 profiling</strong>。
+        </p>
+
+        <h3>把 pipeline 拆成三段先看</h3>
+
+        <p>
+          任何 CV pipeline 一定能拆成三段：
+        </p>
+
+        <pre><code>┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│  前处理      │ ──▶│   推理       │ ──▶│   后处理     │
+│  preprocess │    │  inference   │    │  postprocess│
+└─────────────┘    └─────────────┘    └─────────────┘
+   imread             enqueueV3            NMS
+   resize             (TRT/ORT/...)       softmax
+   normalize                              decode
+   HWC→CHW                                draw box
+   H2D                                    D2H</code></pre>
+
+        <p>
+          先用最简单的 <code>time.time()</code> 把这三段的耗时分开测——别上来就用 Nsight，
+          先用粗的，看哪段最慢：
+        </p>
+
+        <pre><code>import time
+
+times = {"pre": [], "infer": [], "post": []}
+
+for img in test_images:
+    t0 = time.time()
+    x = preprocess(img)
+    t1 = time.time()
+    y = model(x)
+    t2 = time.time()
+    out = postprocess(y)
+    t3 = time.time()
+    times["pre"].append(t1 - t0)
+    times["infer"].append(t2 - t1)
+    times["post"].append(t3 - t2)
+
+# 重点看 P50 和 P95，不要只看平均
+for k, v in times.items():
+    v = sorted(v)
+    print(f"{k:6s}  P50: {v[len(v)//2]*1000:.2f}ms  P95: {v[int(len(v)*0.95)]*1000:.2f}ms")</code></pre>
+
+        <p>
+          这一步会告诉你一个非常重要的事实：<strong>你以为慢的地方，
+          经常不是真正慢的地方</strong>。
+        </p>
+
+        <pre><code>新手以为的耗时分布：
+推理 ████████████████████   90%
+前处理 █                     5%
+后处理 █                     5%
+
+实际跑出来经常是：
+推理 ████                  20%
+前处理 ████████             40%   ← 真正的大头
+后处理 ████████             40%</code></pre>
+
+        <p>
+          特别是 YOLOv8 这类<strong>解码 8400 个 anchor + NMS</strong> 的检测模型，
+          后处理跑在 CPU 上能占整条 pipeline 一半时间。
+          如果你不测就上 TensorRT，把模型推理从 5ms 优化到 1ms——
+          总耗时还是 25ms（前后处理 20ms 没动），加速比从 30 倍变 1.2 倍。
+        </p>
+
+        <blockquote>
+          这一步真正学到的是：<strong>没有 profile 之前，所有优化都是猜</strong>。
+          先测，再排序，再动手。任何高级工程师都不会跳过这一步。
+        </blockquote>
+
+        <h3>三段都不慢？那就要看 GPU timeline</h3>
+
+        <p>
+          如果三段加起来比单看每一段大很多，说明<strong>段之间有空洞</strong>——
+          比如 H2D 拷贝等同步、CUDA stream 卡住、kernel launch 开销大。
+          这时候要上 <strong>Nsight Systems</strong>，看 GPU timeline：
+        </p>
+
+        <pre><code>理想的 GPU timeline：
+GPU:    ████████████████████████████████   ← 全程在跑 kernel
+H2D:    ▓▓                                  ← 拷贝时和计算重叠
+
+实际很多 pipeline 的 timeline：
+GPU:    ████   ████    ████    ████        ← 大量空洞
+H2D:    ▓▓                                  ← 串行拷贝
+                                              ← 空洞 = CPU 在等待
+                                              ← 空洞 = sync 调用</code></pre>
+
+        <p>
+          空洞越多，<strong>说明你不是被算力卡住，是被调度卡住</strong>。
+          这时候光优化模型没用，得去优化数据流和 stream。后面会讲。
+        </p>
+
+        <h2>第三步：拆问题——五道关卡的优化矩阵</h2>
+
+        <p>
+          有了 profile 数据，就能开始决定改哪里。我习惯把所有优化手段
+          放进一个<strong>五层矩阵</strong>，从外到内排查：
+        </p>
+
+        <pre><code>┌───────────────────────────────────────────────────────────┐
+│  Layer 5: 服务化 / 调度                                    │  ← 最外层
+│  - dynamic batch / 流水线并发 / worker 池 / 限流           │
+├───────────────────────────────────────────────────────────┤
+│  Layer 4: 数据流                                            │
+│  - pinned memory / async memcpy / CUDA stream / GPU 前后处理│
+├───────────────────────────────────────────────────────────┤
+│  Layer 3: 推理引擎                                          │
+│  - ONNX 导出 / TensorRT build / 算子融合 / kernel 选择      │
+├───────────────────────────────────────────────────────────┤
+│  Layer 2: 数值精度                                          │
+│  - FP32 → FP16 → INT8 / 量化策略 / 混合精度                 │
+├───────────────────────────────────────────────────────────┤
+│  Layer 1: 模型本身                                          │  ← 最内层
+│  - 结构优化 / 剪枝 / 蒸馏 / 换 backbone                     │
+└───────────────────────────────────────────────────────────┘</code></pre>
+
+        <p>
+          <strong>打个比方</strong>：这五层就像<strong>五个套娃</strong>。
+          最内层（模型本身）改起来最难、风险最大、要重训；最外层（服务化）
+          改起来最容易、风险最小、不改精度。
+          <strong>合理的优化顺序是从外往内</strong>，先把容易的、不动模型的做了，
+          再决定要不要动模型。
+        </p>
+
+        <h3>不同层的特点对比</h3>
+
+        <pre><code>层级          改动风险   精度影响   工程量    典型收益
+─────────────────────────────────────────────────────
+模型本身      高         可能掉      重        1.5~5x
+精度（INT8）  中         可能掉      中        1.5~3x
+推理引擎      低         几乎无      中        2~10x
+数据流        低         无          中        1.2~2x
+服务化        低         无          轻        吞吐 2~10x</code></pre>
+
+        <p>
+          看这个表你会发现一件事：<strong>"推理引擎"那行的性价比最高</strong>——
+          风险最低、收益最大、不掉精度。所以工业里第一刀几乎永远先砍 TensorRT。
+          但前提是 profile 数据告诉你瓶颈确实在推理。
+        </p>
+
+        <h2>层 1：模型本身（最后才动）</h2>
+
+        <p>
+          虽然在矩阵的最内层，但我把它放在第一个讲，因为<strong>你要先看一眼模型结构</strong>，
+          才能判断后面所有的优化策略。看模型主要看三件事：
+        </p>
+
+        <p>
+          <strong>1. 模型大概多大</strong>：
+          1MB 的 MobileNet 和 100MB 的 ResNet101，部署策略完全不同。
+          小模型瓶颈一般在 kernel launch 和数据搬运，大模型瓶颈在计算和显存。
+        </p>
+
+        <p>
+          <strong>2. 主要算子是什么</strong>：
+        </p>
+
+        <pre><code>用 torch.fx 或 onnx 看算子分布：
+
+算子类型分布:
+Conv      ████████████████   60%   ← Conv 多的 TensorRT 收益最大
+MatMul    ████               15%   ← Linear/Attention 也好优化
+BatchNorm ███                10%   ← 推理时融进 Conv
+ReLU      ██                 8%    ← 融进前面的算子
+Add       █                  4%    ← skip connection
+Softmax/  █                  3%    ← 注意数值稳定性
+Sigmoid                            ← 量化敏感算子，部署要小心</code></pre>
+
+        <p>
+          <strong>3. 有没有"奇怪"算子</strong>：
+          比如自定义 grid_sample、deformable conv、动态 if/else 控制流、
+          torch 里的某些原生算子在 ONNX 里没对应。
+          这些算子<strong>会在 ONNX 导出或 TensorRT 构建时报错</strong>，
+          需要写 plugin 或者改模型。提前发现能少踩很多坑。
+        </p>
+
+        <p>
+          看完之后，模型本身的优化手段：
+        </p>
+
+        <pre><code>结构优化（不重训）：
+  ✓ BN 融合（推理时 BN 吸进前面的 Conv）         ← 工具自动做
+  ✓ 常量折叠（trtexec、onnxsim）                 ← 工具自动做
+  ✓ 算子替换（Sigmoid * x → HardSwish）          ← 等价替换，速度更快
+
+结构优化（重训）：
+  • 剪枝（pruning）：砍掉不重要的 channel
+  • 蒸馏（distillation）：用大模型教小模型
+  • 换 backbone（ResNet50 → MobileNetV3）
+  • 减小输入分辨率（640 → 416）  ← 立竿见影但要重测精度</code></pre>
+
+        <blockquote>
+          实战建议：<strong>除非业务要求精度无损又必须达到不可能的延迟，
+          否则不要先动模型结构</strong>。改模型要重训、要重新评估精度、
+          要走完整的回归测试，工程成本是其他优化的 5~10 倍。
+        </blockquote>
+
+        <h2>层 2：数值精度（FP32 → FP16 → INT8）</h2>
+
+        <p>
+          这一层就是上一篇博客讲的量化。不重复讲细节，只讲<strong>选哪个</strong>：
+        </p>
+
+        <pre><code>决策树：
+
+   要不要无损精度？
+        │
+   ┌────┴────┐
+   是         否
+   │         │
+   FP16    INT8 PTQ
+   完成    │
+        精度可接受？
+        ┌────┴────┐
+        是         否
+        │         │
+        完成    INT8 + sensitivity analysis
+                 + 敏感层回退 FP16
+                 │
+              精度可接受？
+              ┌────┴────┐
+              是         否
+              │         │
+              完成     QAT 重训</code></pre>
+
+        <p>
+          <strong>实战上 95% 的 CV 部署项目走这条路径</strong>：先 FP16，
+          再 INT8 PTQ，遇到掉点用混合精度（FP16 + INT8 同时开），
+          只有极少数模型才需要 QAT。
+        </p>
+
+        <p>
+          <strong>一个常见误区</strong>：以为 FP16 是 INT8 的"低配版"。
+          其实<strong>FP16 是最被低估的优化</strong>——它精度损失几乎为零、
+          开启成本极低（builder 加一个 flag）、加速 1.5~2 倍、
+          显存省一半，性价比远超 INT8。
+        </p>
+
+        <h2>层 3：推理引擎（性价比之王）</h2>
+
+        <p>
+          这一层是工业部署的真正主场。三种主流路径：
+        </p>
+
+        <pre><code>路径 A：PyTorch → ONNX → TensorRT  （服务端 GPU 部署，最常见）
+  - 适用：NVIDIA GPU 服务端
+  - 工具：torch.onnx.export + trtexec / TensorRT API
+  - 加速：2~10 倍
+
+路径 B：PyTorch → ONNX → ONNX Runtime  （多硬件兼容）
+  - 适用：CPU 服务、跨平台
+  - 工具：ort 自带的 graph optimizer + execution provider
+  - 加速：1.5~3 倍
+
+路径 C：PyTorch → ONNX → MNN/NCNN/CoreML/TFLite  （端侧）
+  - 适用：手机 / 嵌入式
+  - 工具：各家 converter
+  - 加速：2~5 倍（相比 PyTorch Mobile）</code></pre>
+
+        <h3>导出 ONNX 时容易踩的坑</h3>
+
+        <p>
+          很多人卡在<strong>"PyTorch 跑得对，ONNX 跑得不对"</strong>。
+          这一步要特别小心：
+        </p>
+
+        <pre><code>1. model.eval()
+   ← BN / Dropout 模式不对，导出的图是错的
+
+2. opset_version 不要太低
+   ← 老 opset 不支持某些算子，TRT 会报 unsupported
+   ← 推荐 17 以上
+
+3. dynamic_axes 明确写
+   ← 不写就是固定 shape，换尺寸就崩
+
+4. 导出后用 onnxsim 简化
+   ← TRT 处理简化后的图更容易融合
+   ← 命令：python -m onnxsim model.onnx model_sim.onnx
+
+5. 对齐输出
+   ← 用同一个输入分别跑 PyTorch 和 ONNX Runtime
+   ← 误差应该在 1e-5 量级
+   ← 误差大就说明导出有问题，不要急着上 TensorRT</code></pre>
+
+        <h3>TensorRT 构建时的关键参数</h3>
+
+        <pre><code># 1. 同时开 FP16 和 INT8
+config.set_flag(trt.BuilderFlag.FP16)
+config.set_flag(trt.BuilderFlag.INT8)
+# ↑ 让 TRT 自动给每层挑最优精度
+
+# 2. workspace 给够（影响 kernel 选择空间）
+config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4GB
+
+# 3. 动态 shape profile
+profile = builder.create_optimization_profile()
+profile.set_shape("input",
+    min=(1, 3, 320, 320),
+    opt=(1, 3, 640, 640),
+    max=(1, 3, 1280, 1280))
+config.add_optimization_profile(profile)
+
+# 4. 启用 sparsity（如果模型是 2:4 sparse 训出来的）
+config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
+
+# 5. 选择 INT8 calibrator
+config.int8_calibrator = MyCalibrator(...)</code></pre>
+
+        <p>
+          构建 engine 不止是"传 ONNX 进去得到 engine"。
+          TensorRT 内部会做<strong>大量优化</strong>：
+        </p>
+
+        <pre><code>TRT 构建时内部做的事：
+
+1. 算子融合
+   Conv + BN + ReLU → CBR fused kernel
+   Conv + Add + ReLU → ConvAddReLU fused kernel
+   QKV 三个 Linear → 一个 fused QKV
+   ↑ 减少 kernel launch 次数，减少中间显存
+
+2. 精度选择
+   每层挑最快又满足精度的精度（INT8/FP16/FP32）
+
+3. kernel auto-tuning
+   每层枚举多个 cuDNN/cuBLAS/手写 kernel
+   实测最快的那个，写进 engine
+   ↑ 这就是为什么 TRT 构建慢
+
+4. 内存复用
+   分析每个 tensor 的生命周期，能复用的 buffer 共用一块显存</code></pre>
+
+        <p>
+          所以同一个 ONNX 在不同 GPU 上构建出的 engine 是<strong>不一样的</strong>——
+          A100 上构建的 engine 在 T4 上跑会变慢甚至跑不了。
+          <strong>engine 必须在目标硬件上构建</strong>，这是新手最常忘的事。
+        </p>
+
+        <h2>层 4：数据流（profile 之后才知道有多重要）</h2>
+
+        <p>
+          模型推理优化到极致，再下一刀就是数据流。这是<strong>最容易被忽略，
+          但 profile 之后经常发现的大头</strong>。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：你家厨师做菜超快，从下锅到出锅 1 分钟。
+          但传菜员从厨房走到客人桌上要 5 分钟。客人等的总时间是 6 分钟，
+          不是 1 分钟。优化厨师从 1 分钟到 30 秒没意义——
+          应该优化传菜流程。
+        </p>
+
+        <h3>典型的 CV pipeline 数据流</h3>
+
+        <pre><code>原始流程（每一步串行）：
+imread (host)
+   ↓
+preprocess (host: resize/normalize/HWC→CHW)
+   ↓
+cudaMemcpy H2D            ← 同步拷贝，等
+   ↓
+inference (GPU)            ← 算
+   ↓
+cudaMemcpy D2H            ← 同步拷贝，等
+   ↓
+postprocess (host: NMS/decode)
+   ↓
+draw (host)</code></pre>
+
+        <p>
+          这条流程有三个问题：
+        </p>
+
+        <p>
+          <strong>问题 1：CPU 前处理太慢</strong>。
+          一张 1080P 图，<code>cv::resize</code> + <code>cv::cvtColor</code> +
+          <code>normalize</code> + HWC→CHW，加起来能要 5~10ms。
+          模型推理才 2ms，前处理占了 2.5 倍。
+        </p>
+
+        <p>
+          <strong>问题 2：H2D / D2H 同步拷贝</strong>。
+          普通 <code>cudaMemcpy</code> 是同步的，GPU 算的时候 CPU 在等。
+          换成 <code>cudaMemcpyAsync</code> + pinned memory 可以让拷贝和计算重叠。
+        </p>
+
+        <p>
+          <strong>问题 3：后处理在 CPU</strong>。
+          YOLOv8 的 8400 个 anchor 解码 + NMS，CPU 单线程要 10ms 以上。
+          全 GPU 后处理只要 200μs。
+        </p>
+
+        <h3>数据流优化的顺序</h3>
+
+        <pre><code>优化等级 1：GPU 化前处理（收益大）
+  原始：cv::resize → cv::cvtColor → normalize → HWC→CHW
+  改：写一个 CUDA kernel 一次性把这些做完
+  ↑ 输入只需要传原始 uint8 图到 GPU，GPU 内部做所有处理
+  ↑ 收益：前处理 5ms → 0.2ms
+
+优化等级 2：pinned memory + 异步拷贝（收益中）
+  原始：cudaMalloc + cudaMemcpy
+  改：cudaMallocHost + cudaMemcpyAsync + stream
+  ↑ 拷贝和计算重叠，端到端延迟降 10~20%
+
+优化等级 3：GPU 化后处理（收益大）
+  原始：tensor → CPU → 遍历 8400 anchor → NMS → 框
+  改：GPU kernel 解码 anchor → GPU NMS → 只 D2H 最终的几个框
+  ↑ D2H 数据量从 8400×85 浮点 减到 100 个框
+  ↑ 收益：后处理 10ms → 0.3ms
+
+优化等级 4：CUDA Graph（端到端串起来）
+  把整条 stream 操作 capture 成一个 graph
+  之后单次 cudaGraphLaunch 提交整条流水线
+  ↑ 消除 kernel launch 开销（每个 launch 5~20μs）
+  ↑ 小模型场景能再降 20~40% 延迟</code></pre>
+
+        <h3>一个真实的 YOLOv8 优化案例</h3>
+
+        <pre><code>原始 PyTorch 推理：    44ms
+↓ 导出 ONNX + TRT FP32:  18ms   ← 推理引擎 (层 3)
+↓ TRT FP16:               9ms   ← 数值精度 (层 2)
+↓ TRT INT8:               5ms   ← 数值精度 (层 2)
+                                 ← 但前后处理还是 CPU
+                                 ← 实际端到端 25ms = 5ms 推理 + 20ms 前后处理
+↓ GPU 前处理:             3ms   ← 数据流 (层 4)
+↓ GPU 后处理 + NMS:       1ms   ← 数据流 (层 4)
+↓ CUDA Graph:           0.8ms   ← 数据流 (层 4)
+
+最终：端到端 ~ 0.9ms，从 44ms 加速 ~50 倍</code></pre>
+
+        <p>
+          看这个表你应该明白一件事：<strong>从层 3 到层 2 的收益（44→5ms）
+          是显眼的，但从层 4 拿到的收益（25→0.9ms）才是真正吓人的</strong>。
+          新手只会做层 3 和层 2，因为这两步有现成工具；
+          层 4 要自己写 CUDA kernel，门槛高但收益大。这是高级工程师和初级工程师拉开差距的地方。
+        </p>
+
+        <h2>层 5：服务化（如果是线上服务）</h2>
+
+        <p>
+          单帧延迟做到极致之后，如果你做的是服务（而不是嵌入式设备），
+          下一刀就是吞吐和并发。
+        </p>
+
+        <h3>dynamic batching</h3>
+
+        <p>
+          单张图 1ms，10 张图一起送进去可能只要 3ms。
+          单张吞吐 = 1000 QPS，10 batch 吞吐 = 3333 QPS。
+        </p>
+
+        <pre><code>核心思想：累积一小段时间的请求，凑成 batch 一起推理
+
+请求到达流：
+t=0ms  : req_1
+t=2ms  : req_2
+t=5ms  : req_3
+t=7ms  : req_4
+...
+
+batch 收集逻辑：
+等待最多 10ms，或者凑够 8 张图，就触发一次推理
+
+trade-off：
+batch 大 → 吞吐高，但每个请求的延迟变长
+batch 小 → 延迟低，但吞吐低
+工具：Triton Inference Server 自带 dynamic batching</code></pre>
+
+        <h3>流水线并发</h3>
+
+        <p>
+          一条 pipeline 拆成三段：前处理 / 推理 / 后处理。
+          每段用一个线程或 CUDA stream，<strong>三段同时在不同请求上工作</strong>：
+        </p>
+
+        <pre><code>时间 →
+
+普通串行：
+[pre1][inf1][post1] [pre2][inf2][post2] [pre3][inf3][post3]
+
+流水线并发（3 段）：
+[pre1][pre2][pre3][pre4][pre5]            ← thread A
+      [inf1][inf2][inf3][inf4][inf5]      ← thread B（GPU）
+            [post1][post2][post3][post4]  ← thread C
+
+总吞吐 = 最慢段的吞吐
+单帧延迟 ≈ 三段之和（没变）
+吞吐 ≈ 3 倍</code></pre>
+
+        <h3>多 stream / 多 context</h3>
+
+        <p>
+          一张 GPU 可以创建多个 TensorRT context、多个 CUDA stream。
+          <strong>请求之间用不同 stream 提交</strong>，GPU 可以同时跑多条 pipeline。
+          但要注意 GPU 算力是有限的，stream 多了会互相挤算力，
+          通常 2~4 个 stream 是甜点。
+        </p>
+
+        <h3>选 Triton 还是自己写 server</h3>
+
+        <pre><code>自己写 (FastAPI + TensorRT)：
+  ✓ 灵活，业务逻辑可以塞进去
+  ✗ dynamic batch / 多模型 / 多 GPU 都要自己写
+  ✗ 监控指标要自己埋
+
+Triton Inference Server：
+  ✓ dynamic batch / 多模型 / 多 GPU / metrics 全自带
+  ✓ 工业标准，HTTP/gRPC 都支持
+  ✗ 业务逻辑要单独前置一层
+  ✗ 学习曲线陡
+
+选型：纯模型推理服务用 Triton；
+     业务逻辑复杂、模型只是一部分用 FastAPI。</code></pre>
+
+        <h2>第四步：把优化矩阵套到一个具体例子上</h2>
+
+        <p>
+          光讲方法论容易抽象。下面用一个真实场景把整个流程跑一遍。
+        </p>
+
+        <h3>场景：人脸识别门禁系统</h3>
+
+        <p>
+          算法工程师给了你一套 pipeline：
+        </p>
+
+        <pre><code>摄像头 → 人脸检测 (RetinaFace)
+       → 人脸对齐 (5 点 landmark 仿射变换)
+       → 人脸识别 (ArcFace embedding)
+       → 数据库匹配 (cosine similarity)
+       → 输出结果
+
+要求：摄像头 30fps，单路 RK3588 NPU 部署，识别准确率不能掉</code></pre>
+
+        <h3>第一步：问 4 个问题</h3>
+
+        <pre><code>1. 硬件：RK3588（瑞芯微 ARM 芯片 + 6 TOPS NPU）
+   → 不能用 TensorRT，走 RKNN 工具链
+   → 必须 INT8 才能用 NPU，否则只能跑 CPU
+
+2. 业务约束：30fps = 33ms 单帧
+   精度不能掉 → INT8 量化需要谨慎，可能要 QAT
+
+3. baseline：当前 PyTorch 在 RK3588 CPU 跑，单帧 250ms
+   → 必须用 NPU，否则没戏
+
+4. 上下游：摄像头是 RTSP H.264 流，输出到屏幕
+   → 解码可以用硬件解码器</code></pre>
+
+        <h3>第二步：profile 一下</h3>
+
+        <pre><code>当前 CPU pipeline（PyTorch）：
+
+视频解码     ████████  50ms   ← 软解码慢
+人脸检测     ████████ 80ms
+人脸对齐     █         5ms
+人脸识别     ████████ 100ms
+数据库匹配   █          1ms
+绘制         ██         15ms
+─────────────────────────────
+总计                  251ms   ← 4fps，离 30fps 差 8 倍</code></pre>
+
+        <h3>第三步：套五层矩阵</h3>
+
+        <p>
+          <strong>层 5 服务化</strong>：单路摄像头，不涉及。跳过。
+        </p>
+
+        <p>
+          <strong>层 4 数据流</strong>：
+        </p>
+
+        <pre><code>- 视频解码改硬件解码：50ms → 5ms
+  RK3588 有专用 MPP 解码模块
+- 解码出来的 NV12 直接送 NPU，不用转 BGR
+- 后处理在 NPU 上做（如果工具支持）</code></pre>
+
+        <p>
+          <strong>层 3 推理引擎</strong>：
+        </p>
+
+        <pre><code>- PyTorch → ONNX → RKNN
+- RKNN converter 会自动做算子融合
+- 检测模型用 RetinaFace-MobileNet0.25 替换（已经轻量）
+- 识别模型 ArcFace-ResNet50 → ArcFace-MobileFaceNet</code></pre>
+
+        <p>
+          <strong>层 2 数值精度</strong>：
+        </p>
+
+        <pre><code>- 必须 INT8（NPU 只支持 INT8）
+- 校准集：用门禁场景实际采集的 500 张人脸图
+  绝对不能用 LFW 之类的公开数据集（光照/姿态都不一样）
+- 先 PTQ：识别准确率从 99.5% 掉到 97.2%，业务不接受
+- 上 QAT：用 ms1m + 自采数据 fine-tune 5 个 epoch
+- QAT 后：准确率 99.3%，可接受</code></pre>
+
+        <p>
+          <strong>层 1 模型本身</strong>：
+        </p>
+
+        <pre><code>- RetinaFace 输入从 640 → 320（门禁画面里的脸够大）
+- 检测置信度阈值 0.5 → 0.7（减少误检的对齐计算）
+- 识别模型从 ResNet50 → MobileFaceNet（已经在层 3 做了）</code></pre>
+
+        <h3>第四步：跑一遍看结果</h3>
+
+        <pre><code>优化后 pipeline：
+
+视频解码 (MPP)    █          5ms
+人脸检测 (NPU)    ███        10ms
+人脸对齐 (CPU)    █           3ms
+人脸识别 (NPU)    ██          8ms
+数据库匹配        █           1ms
+绘制              █           3ms
+─────────────────────────────────
+总计                          30ms   ← 33fps，达标</code></pre>
+
+        <p>
+          整个过程没有写一行 CUDA kernel（端侧用不了），
+          但<strong>逻辑是一样的</strong>：先问问题，再 profile，
+          再按"外层 → 内层"的顺序套五层矩阵。
+        </p>
+
+        <h2>常见的"伪优化"</h2>
+
+        <p>
+          最后给几个工业里经常听到、但其实有坑的说法：
+        </p>
+
+        <h3>1. "换 TensorRT 立马快 10 倍"</h3>
+
+        <p>
+          只有当模型瓶颈在 GPU 计算时，TensorRT 才会真的快 10 倍。
+          如果你的瓶颈在 CPU 前后处理（很常见），换 TensorRT 也就快 1.5 倍。
+          <strong>先 profile，再选工具</strong>。
+        </p>
+
+        <h3>2. "INT8 精度掉是因为量化技术不行"</h3>
+
+        <p>
+          90% 的"INT8 掉精度"都不是量化技术问题，而是：
+        </p>
+
+        <ul>
+          <li>校准集选错了</li>
+          <li>没开 per-channel</li>
+          <li>敏感层没保留 FP16</li>
+          <li>BN 没融合就量化</li>
+        </ul>
+
+        <p>
+          甩锅给量化是新手常见操作。
+        </p>
+
+        <h3>3. "我量化完测了一下，输出 cosine similarity 0.99，肯定没问题"</h3>
+
+        <p>
+          tensor 级别的相似度 ≠ 业务指标。检测模型 cosine 0.99 仍可能 mAP 掉 5 个点。
+          <strong>必须在业务数据上测业务指标</strong>。
+        </p>
+
+        <h3>4. "我开了 dynamic batch，吞吐应该上去了"</h3>
+
+        <p>
+          dynamic batch 的前提是<strong>多个请求几乎同时到达</strong>。
+          如果业务是 QPS 10，每个请求间隔 100ms，dynamic batch 等不到第二个就超时了。
+          收益接近 0。
+        </p>
+
+        <h3>5. "我跑过 trtexec，所以我会 TensorRT"</h3>
+
+        <p>
+          trtexec 只是个 CLI 工具，离"会用 TensorRT"还差：
+          IInt8Calibrator、IPluginV2、IExecutionContext 多线程、
+          CUDA Graph、stream 调度…… <strong>动手写一个完整的 inference server
+          才算入门</strong>。
+        </p>
+
+        <h2>面试时怎么讲部署优化经验</h2>
+
+        <p>
+          如果简历写了"做过模型部署优化"，按这个框架讲不容易翻车：
+        </p>
+
+        <pre><code>1. 业务背景：什么场景 + 什么硬件 + 什么约束
+   ✓ "门禁人脸识别，RK3588，30fps，准确率不能掉"
+
+2. 你做的 profile：分析过程
+   ✓ "原始 PyTorch 跑 251ms，瓶颈分布是 解码 50ms + 检测 80ms + 识别 100ms"
+   ✗ "我用 TensorRT 优化了一下"  ← 没有分析过程
+
+3. 优化路径：按层级讲（最有逻辑）
+   ✓ "先做数据流：硬件解码代替软解码，省 45ms
+      再做推理引擎：换 RKNN，开 INT8，省 130ms
+      最后做模型：检测输入降到 320，省 10ms"
+
+4. 踩过的坑：体现你真做过
+   ✓ "PTQ 掉了 2.3 个点，分析下来发现最后的 embedding 层敏感，
+      用 sensitivity analysis 找到这一层后做 QAT，掉点回到 0.2"
+
+5. 收益数字：三组
+   - 端到端延迟：251ms → 30ms（8.4 倍）
+   - 准确率：99.5% → 99.3%（业务可接受）
+   - 功耗：3.5W → 1.8W（NPU 比 CPU 省）
+
+6. 你学到的方法论：体现"你能复用"
+   ✓ "这套思路我后来用在 OCR 部署上，从 180ms 优化到 22ms"
+   → 面试官最爱听这种，说明你不是死板套流程，是理解了原理</code></pre>
+
+        <h2>总结：一张图记住所有</h2>
+
+        <pre><code>┌──────────────────────────────────────────────────────────┐
+│                                                            │
+│   拿到 pipeline 之后的标准流程                             │
+│                                                            │
+│   ┌───────────────┐                                       │
+│   │  1. 问问题     │  硬件 / 约束 / baseline / 上下游       │
+│   └───────┬───────┘                                       │
+│           ▼                                                │
+│   ┌───────────────┐                                       │
+│   │  2. 测一下     │  端到端 profile，拆 pre/infer/post    │
+│   └───────┬───────┘                                       │
+│           ▼                                                │
+│   ┌───────────────┐    Layer 5: 服务化（吞吐）             │
+│   │  3. 套五层     │    Layer 4: 数据流（GPU 化前后处理）  │
+│   │     矩阵      │    Layer 3: 推理引擎（TRT/ORT）        │
+│   │   (从外到内)   │    Layer 2: 精度（FP16/INT8）          │
+│   │               │    Layer 1: 模型（剪枝/蒸馏）          │
+│   └───────┬───────┘                                       │
+│           ▼                                                │
+│   ┌───────────────┐                                       │
+│   │  4. 回归测试   │  业务指标 + 延迟 P50/P95/P99 + 显存   │
+│   └───────────────┘                                       │
+│                                                            │
+└──────────────────────────────────────────────────────────┘</code></pre>
+
+        <p>
+          初级工程师拿到模型直接上 TensorRT，遇到掉精度就换 QAT，遇到不快就换硬件；
+          高级工程师拿到模型先放下键盘，问完问题、测完 profile、画出 timeline，
+          然后<strong>从外到内一层一层处理</strong>。
+          <strong>差别不在工具，在顺序</strong>。
+        </p>
+
+        <p>
+          这套 roadmap 不只适用于 CV 端侧。把里面的"NPU"换成"GPU"、
+          "RKNN"换成"TensorRT"、"端侧"换成"服务端"，
+          整个框架对 LLM 部署、ASR 部署、推荐系统部署都成立。
+          因为底层逻辑都是一样的：<strong>用工程手段把模型和硬件对齐</strong>。
+        </p>
+
+        <p>
+          下一篇我会挑一个具体的小模型（比如 YOLOv8n 或 MobileFaceNet），
+          按这套流程从头到尾做一遍，把每一层的代码、profile 数据、坑都写出来。
+          这篇先把"思考框架"建起来，下一篇是"实际操作"。
+        </p>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>A quiet blog.</p>
+    </footer>
+  </body>
+</html>

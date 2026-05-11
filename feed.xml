@@ -6,7 +6,21 @@
     <link>https://wangzijian1010.github.io/my-blog/</link>
     <atom:link href="https://wangzijian1010.github.io/my-blog/feed.xml" rel="self" type="application/rss+xml" />
     <language>zh-CN</language>
-    <lastBuildDate>Sat, 09 May 2026 00:00:00 +0800</lastBuildDate>
+    <lastBuildDate>Mon, 11 May 2026 00:00:00 +0800</lastBuildDate>
+    <item>
+      <title>拿到一个 CV pipeline，高级工程师是怎么拆解和优化的</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/cv-deployment-optimization-roadmap.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/cv-deployment-optimization-roadmap.html</guid>
+      <description>不针对大模型，专写小模型 CV 端侧部署。从算法工程师手里接到一个 pipeline 之后，第一步该问什么、第二步该测什么、第三步该改什么，给一份能套用的优化 roadmap。</description>
+      <pubDate>Mon, 11 May 2026 00:00:00 +0800</pubDate>
+    </item>
+    <item>
+      <title>从零开始啃量化：先跑起来，再讲清楚为什么会更快</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/quantization-from-scratch.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/quantization-from-scratch.html</guid>
+      <description>给从没接触过量化的人写的入门：用汇率、温度计、超市货架这些日常类比讲清楚 scale / zero_point / 校准 / PTQ / QAT / Tensor Core，从动手到原理，从原理到 TensorRT 工程落地。</description>
+      <pubDate>Mon, 11 May 2026 00:00:00 +0800</pubDate>
+    </item>
     <item>
       <title>给 lite.ai.toolkit 加 LLM 推理：路线 + 待办</title>
       <link>https://wangzijian1010.github.io/my-blog/posts/lite-ai-toolkit-llm-roadmap.html</link>
