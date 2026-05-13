@@ -1,0 +1,898 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>YOLOv8n 在 RK3588 和 Jetson Nano 上的部署实战对比 | 慢慢写</title>
+    <meta
+      name="description"
+      content="从 PyTorch 到板端推理，YOLOv8n 分别在瑞芯微 RK3588（RKNN NPU）和 Jetson Nano（TensorRT）上的完整部署流程、profile 数据、踩坑记录和面试话术。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="YOLOv8n 在 RK3588 和 Jetson Nano 上的部署实战对比">
+    <meta property="og:description" content="从 PyTorch 到板端推理，YOLOv8n 分别在瑞芯微 RK3588（RKNN NPU）和 Jetson Nano（TensorRT）上的完整部署流程、profile 数据、踩坑记录和面试话术。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/yolov8n-rk3588-jetson-nano.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../archive.html">Posts</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">embedded deployment</p>
+          <h1>YOLOv8n 在 RK3588 和 Jetson Nano 上的部署实战对比</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-12">2026.05.12</time>
+            <span>YOLOv8</span>
+            <span>RK3588</span>
+            <span>Jetson Nano</span>
+            <span>RKNN</span>
+            <span>TensorRT</span>
+            <span>端侧部署</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          最近面试时被频繁问到国产芯片的部署经验。我把自己在 RK3588 和 Jetson Nano 上
+          部署 YOLOv8n 的全过程写下来——从拿到 PyTorch 模型到在板子上跑出 30fps，
+          两个平台并排分析。读完你能在面试里有理有据地讲清楚：国产 NPU 和 NVIDIA 嵌入式
+          各自的门道、坑在哪、什么时候该选哪个。
+        </p>
+
+        <h2>两个平台，先看一张对比表</h2>
+
+        <p>
+          面试官问"RK3588 和 Jetson Nano 有什么区别"，不要背参数，要讲<strong>设计理念不同</strong>。
+        </p>
+
+        <pre><code>                    RK3588                          Jetson Nano
+───────────────────────────────────────────────────────────────
+ 芯片类型           ARM SoC + 自研 NPU                ARM SoC + NVIDIA GPU
+                     (CPU + GPU + NPU 三合一)           (CPU + GPU 二合一)
+
+ 架构               ARM 四核 A76 + 四核 A55           ARM 四核 A57
+                    Mali-G610 GPU                     Maxwell 128-core GPU
+                    NPU: 3 核, 6 TOPS (INT8)          GPU: 472 GFLOPS (FP16)
+
+ AI 算力            6 TOPS (前提是 INT8)              0.47 TFLOPS (FP16)
+                    ≈ 等效 FP16 约 1.5T               ≈ 等效 INT8 约 0.9T
+
+ 量化要求            必须 INT8                          FP16 即可
+                     否则 NPU 不能用                    可选 INT8 (DP4A)
+
+ 部署工具链          RKNN (Rockchip 闭源)              TensorRT (NVIDIA 开源部分)
+                    rknn-toolkit2                     trtexec + trt API
+
+ 推理框架           只有 RKNN                          TensorRT / ONNX Runtime
+
+ 操作系统            Ubuntu / Debian / Android         Ubuntu (JetPack SDK)
+
+ 功耗               整板 ~5-15W                       整板 ~5-10W
+
+ 价格               ~$100-150 (开发板)                 ~$99 (已停产, Orin Nano 替代)
+
+ 社区生态           中文社区为主, 文档碎片化            NVIDIA 官方文档 + 全球社区</code></pre>
+
+        <p>
+          <strong>核心差异一句话</strong>：Jetson Nano 走的是"跟服务器一样的 TensorRT 路线，
+          只是算力缩水"，你服务端的经验几乎可以直接平移。RK3588 走的是
+          "NPU 专用指令集 + 闭源工具链"，你得换个脑子——
+          <strong>它像在使用别人的黑盒，得学会在边界内做事</strong>。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：Jetson Nano 是你熟悉的那家五星级大酒店的迷你版，
+          厨房设备（TensorRT）、菜谱（ONNX）、调料（CUDA）都跟总店一样，就是锅小了点。
+          RK3588 是隔壁开了个排档，厨房设备（NPU）你不认识，调料罐上的标签（RKNN 文档）
+          都是方言写的，但<strong>做出来的菜（30fps YOLOv8n）一样能吃，甚至更便宜</strong>。
+        </p>
+
+        <h2>YOLOv8n 是什么，先看清楚你要部署的模型</h2>
+
+        <p>
+          在任何硬件上部署任何模型之前，第一件事是<strong>看清楚这个模型长什么样</strong>。
+          很多人跳过了这一步，到工具链报"算子不支持"时才抓瞎。
+        </p>
+
+        <pre><code>YOLOv8n 结构拆解：
+
+参数量: 3.2M
+输入:   1 × 3 × 640 × 640
+FLOPs:  8.7G
+
+算子构成:
+  Conv2d          ████████████████████████  ~75%
+  Concat           ███                      ~8%    ← 多尺度特征拼接
+  Resize/Upsample  ██                       ~5%    ← 上采样
+  Split/Slice      █                        ~3%    ← 多尺度输出
+  Sigmoid          █                        ~2%    ← 检测头
+  Other (MaxPool, etc)                    ~7%
+
+在 NPU/GPU 上的关键特征:
+  ✓ Conv 占比极高 → 设备利用率容易打满
+  ✗ 有 Concat + 多分支 → 图结构不完全是线性的
+  ✗ 检测头有 Sigmoid × value → 量化敏感算子
+  ✗ 输出 3 个不同尺度的 feature map → 后处理复杂</code></pre>
+
+        <p>
+          结论：YOLOv8n 的 Conv 占比高，对两个平台都是好消息——NPU/GPU 都擅长 Conv。
+          但 Concat + Sigmoid + 多尺度输出会在特定步骤出问题，下面逐平台讲。
+        </p>
+
+        <h2>路径 A：RK3588 + RKNN</h2>
+
+        <h3>A.1 工具链总览</h3>
+
+        <p>
+          RK3588 的核心是那颗 6 TOPS 的 NPU。入口是
+          <strong>PyTorch → ONNX → RKNN</strong>，中间必须过 ONNX。
+        </p>
+
+        <pre><code>完整链路:
+
+    PyTorch (yolov8n.pt)
+        │
+        ▼  torch.onnx.export()
+    ONNX (yolov8n.onnx)
+        │
+        ▼  rknn-toolkit2 (PC 端)
+           ├─ 导入 ONNX
+           ├─ 量化 (INT8, 校准集)
+           ├─ 编译 → NPU 可执行格式
+           ▼
+    RKNN (yolov8n.rknn)
+        │
+        ▼  拷到板子上
+    RK3588 端 C++ 推理
+        ├─ rknn_init()  加载模型到 NPU
+        ├─ rknn_inputs_set()  喂输入 tensor
+        ├─ rknn_run()         NPU 推理
+        └─ rknn_outputs_get() 拿输出 tensor</code></pre>
+
+        <p>
+          跟 TensorRT 不一样的地方：<strong>RKNN 的转换是在 PC 上跑的</strong>，
+          NPU 只负责推理。它不像 TensorRT 那样有 runtime 级别的优化器，
+          转换阶段就决定了最终性能。所以 RKNN 的<strong>转换这一步非常重要</strong>。
+        </p>
+
+        <h3>A.2 PyTorch → ONNX：第一步就不能马虎</h3>
+
+        <p>
+          RKNN 工具链对 ONNX 的要求比 TensorRT 更苛刻。<strong>算子支持列表更短</strong>，
+          很多 TensorRT 能自动支持的 op，RKNN 会直接挂。
+        </p>
+
+        <pre><code># YOLOv8n ONNX 导出的关键注意事项
+
+import torch
+from ultralytics import YOLO
+
+# 1. 转成 torchscript 再转 ONNX 有时比直接 export 好
+model = YOLO("yolov8n.pt").model.eval().cpu()
+
+# 2. 动态 shape 在 RKNN 上容易出问题
+#    RKNN 建议固定输入尺寸
+dummy_input = torch.randn(1, 3, 640, 640)
+
+torch.onnx.export(
+    model,
+    dummy_input,
+    "yolov8n.onnx",
+    opset_version=12,        # RKNN 对 17 支持不好，用 12
+    input_names=["images"],
+    output_names=["output0", "output1", "output2"],
+    dynamic_axes=None        # 不导出动态 shape
+)
+
+# 3. 导出之后必做：用 onnx.checker 验证
+import onnx
+onnx.checker.check_model("yolov8n.onnx")</code></pre>
+
+        <p>
+          <strong>一个容易卡住的地方</strong>：ultralytics 的 Detect head 输出了
+          <code>torch.cat</code> 拼接后的单 tensor（1×84×8400），
+          但有些版本的 ultralytics 导出的是三个分开的 tensor。
+          这会影响 RKNN 的图解析。<strong>先确认 ONNX 的输出节点到底有几个、叫什么</strong>：
+        </p>
+
+        <pre><code>import onnx
+m = onnx.load("yolov8n.onnx")
+for out in m.graph.output:
+    print(out.name)
+# 应该看到类似:
+# output0   (1, 84, 8400)
+# 或者:
+# output0   (1, 144, 80, 80)   ← 多尺度版本
+# output1   (1, 144, 40, 40)
+# output2   (1, 144, 20, 20)</code></pre>
+
+        <h3>A.3 ONNX → RKNN：量化是关键</h3>
+
+        <p>
+          RK3588 的 NPU <strong>只支持 INT8</strong>，所以转换时必须通过量化。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：TensorRT 给你三个档位——FP32 / FP16 / INT8，你可以慢慢调试。
+          但 RK3588 NPU 只有一档——INT8。<strong>你必须一次调对</strong>，
+          因为没别的精度可以 fallback。如果 INT8 精度不行，只能降级到 ARM CPU 跑 NPU 不参与。
+        </p>
+
+        <pre><code># rknn-toolkit2 转换代码
+
+from rknn.api import RKNN
+
+rknn = RKNN(verbose=True)
+
+# 1. 配置
+#    target_platform: "rk3588"
+#    quantized_dtype: 只能是 INT8
+rknn.config(
+    mean_values=[[0, 0, 0]],       # BGR 归一化参数
+    std_values=[[255, 255, 255]],  # 如果预处理已经做了归一化，这里全填 1
+    target_platform="rk3588",
+    quantized_dtype="asymmetric_quantized-8",
+)
+
+# 2. 加载 ONNX
+ret = rknn.load_onnx(model="yolov8n.onnx")
+if ret != 0:
+    print("load failed:", ret)     # ← 检查失败原因最重要的一步
+
+# 3. 构建量化模型（这一步在 PC 上校准）
+#    dataset.txt 里每行一张图的路径
+ret = rknn.build(
+    do_quantization=True,
+    dataset="calibration.txt",     # 校准集图片列表
+    rknn_batch_size=1,
+)
+if ret != 0:
+    print("build failed:", ret)
+
+# 4. 导出
+rknn.export_rknn("yolov8n.rknn")
+
+# 5. 验证精度（可选但强烈建议）
+ret = rknn.accuracy_analysis(inputs=["calibration.txt"])</code></pre>
+
+        <h3>A.4 校准：RK3588 精度会不会掉，全靠这一步</h3>
+
+        <p>
+          RKNN 里校准的方式跟 TensorRT 不一样。它<strong>不需要你自己写 calibrator 类</strong>，
+          而是在 build 时传一个图片路径列表，RKNN 内部自己跑。
+          但好处和坏处都在这里——<strong>你没权限看和改内部的校准逻辑</strong>，
+          只能通过调数据集来影响。
+        </p>
+
+        <pre><code>校准集准备的实战建议:
+
+1. 数量：推荐 500~2000 张
+   ← 比 TensorRT Entropy 校准要多一些
+   ← 因为 RKNN 校准的内部逻辑你没法调，只能靠数量兜底
+
+2. 覆盖：
+   ✓ 多尺寸（640×640 为主，但也加几张 320×320 的）
+   ✓ 多光照（白天 / 黄昏 / 夜间）
+   ✓ 多场景（室内 / 室外 / 遮挡）
+   ✓ 如果目标场景是特定摄像头，最好用那个摄像头实际拍的
+
+3. 格式：
+   校准图片必须是预处理后的格式
+   ← 如果预处理做了 letterbox + normalize，校准图也要是
+   ← lot 人卡在这儿：校准图是原始 RGB，NPU 收到的是归一化后的 BGR</code></pre>
+
+        <p>
+          <strong>精度不够怎么办</strong>：换校准集 → 换更多校准集 → 考虑
+          <strong>hybrid quantization</strong>（混合量化，RKNN 2.0+ 支持）。
+          如果所有努力之后还是不行，<strong>那就只能不用 NPU，纯 CPU 跑</strong>。
+          这是使用国产 NPU 必须接受的现实——<strong>没有 fallback 到 FP16 这条路</strong>。
+        </p>
+
+        <pre><code># 混合量化的思路（如果支持的话）
+# 把精度敏感的层手动指定为 FP16
+
+# 先跑一遍全部 INT8 看哪几层误差大
+rknn.accuracy_analysis()
+
+# 对这 2-3 层改成 FP16
+rknn.hybrid_quantization_step1(model="yolov8n.onnx")
+# 指定敏感层
+rknn.hybrid_quantization_step2(
+    model_input="yolov8n.onnx",
+    data_quant="calibration.txt",
+    hybrid_quantization_type="per-channel",
+    hybrid_type=["output0_conv", "output1_conv"],  # 假设这俩敏感
+)
+rknn.hybrid_quantization_step3()</code></pre>
+
+        <h3>A.5 板端 C++ 推理代码</h3>
+
+        <p>
+          前面的工作都在 PC 上，现在切换到 RK3588 板子。<strong>这里的环境配置比推理代码本身更难</strong>。
+        </p>
+
+        <pre><code># 板端库安装（RK3588 Ubuntu 下）
+
+# 从 Rockchip GitHub 下载 librknnrt.so
+# 这是预编译的，没有源码，也没有 apt install
+# 地址: github.com/rockchip-linux/rknpu2
+
+sudo cp librknnrt.so /usr/lib/
+sudo ldconfig
+
+# 验证 NPU 能用
+cat /sys/kernel/debug/rknpu/load
+# 输出类似: 0%   ← 空载</code></pre>
+
+        <pre><code>// RK3588 端 C++ 推理代码 (简化版)
+
+#include &lt;stdio.h&gt;
+#include "rknn_api.h"
+
+int main() {
+    // 1. 加载模型
+    rknn_context ctx;
+    int model_len = 0;
+    unsigned char *model = load_file("yolov8n.rknn", &model_len);
+    rknn_init(&ctx, model, model_len, 0, NULL);
+
+    // 2. 查询输入输出信息
+    rknn_input_output_num io_num;
+    rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
+
+    // 3. 准备输入（注意: NPU 期望的输入格式跟预处理一致）
+    rknn_input inputs[1];
+    memset(inputs, 0, sizeof(inputs));
+    inputs[0].index = 0;
+    inputs[0].type = RKNN_TENSOR_UINT8;           // ← 原始 uint8
+    inputs[0].fmt = RKNN_TENSOR_NHWC;              // ← NHWC 格式！
+    inputs[0].buf = img_data;                      // 原始图像 buffer
+    inputs[0].size = 640 * 640 * 3;
+
+    // 注意: 如果上面用了 mean_values / std_values 做归一化,
+    // 送入的是已经预处理过的图像; 如果没设, NPU 内部不做归一化
+
+    rknn_inputs_set(ctx, io_num.n_input, inputs);
+
+    // 4. 推理
+    rknn_run(ctx, NULL);
+
+    // 5. 拿输出
+    rknn_output outputs[io_num.n_output];
+    memset(outputs, 0, sizeof(outputs));
+    for (int i = 0; i &lt; io_num.n_output; i++) {
+        outputs[i].want_float = 1;                 // 输出转 float
+    }
+    rknn_outputs_get(ctx, io_num.n_output, outputs, NULL);
+
+    // 6. 后处理 (CPU 端)
+    // outputs[0].buf 就是网络输出，自己解码 + NMS
+    std::vector&lt;Box&gt; boxes;
+    decode_output((float*)outputs[0].buf, boxes);  // 8400 个 anchor 解码
+    nms(boxes, 0.45);                              // NMS
+
+    // 7. 释放
+    rknn_outputs_release(ctx, io_num.n_output, outputs);
+    rknn_destroy(ctx);
+    free(model);
+    return 0;
+}</code></pre>
+
+        <h3>A.6 看看 profile 数据</h3>
+
+        <pre><code>RK3588 + YOLOv8n INT8 耗时分布（单帧 640×640）
+
+预处理 (CPU, cv::resize)     ████  4.2ms
+rknn_inputs_set (H2D)        ██    1.8ms
+rknn_run (NPU 推理)          ███████ 7.5ms     ← NPU 主耗时
+rknn_outputs_get (D2H)       ██    1.5ms
+后处理 (CPU, decode + NMS)   █████ 4.8ms
+────────────────────────────────
+总计                          19.8ms  ≈ 50fps
+
+NPU 负载 (dmesg 看):         ~85%
+CPU 负载 (top 看):           单核 ~90% (后处理)</code></pre>
+
+        <p>
+          50fps，门禁场景绰绰有余。<strong>但瓶颈不在 NPU</strong>——前后处理各占
+          4~5ms，加起来和 NPU 推理差不多。如果要继续优化，方向是：
+        </p>
+
+        <ul>
+          <li>后处理用 RGA (Rockchip 的 2D 加速器) 做 resize</li>
+          <li>NMS 换成非极大值抑制的加速版本</li>
+          <li>如果输入从摄像头来，直接用 NV12 格式，省去 cvtColor</li>
+        </ul>
+
+        <pre><code>进一步优化后:
+
+预处理 (RGA 硬件缩放)        █    0.5ms        ← 涨
+rknn_inputs_set              ██   1.8ms
+rknn_run (NPU)               ███████ 7.5ms
+rknn_outputs_get             ██   1.5ms
+后处理 (CPU 优化版)          ███  3.0ms        ← 涨
+───────────────────────────────
+总计                          14.3ms  ≈ 70fps</code></pre>
+
+        <h2>路径 B：Jetson Nano + TensorRT</h2>
+
+        <h3>B.1 工具链总览</h3>
+
+        <p>
+          Jetson Nano 走的是你熟悉的 TensorRT 路线，<strong>但是</strong>——
+          Nano 的 GPU 是 Maxwell 架构，跟服务器上的 Volta / Ampere / Hopper
+          有本质差异。
+        </p>
+
+        <pre><code>Maxwell (Jetson Nano) vs Ampere (A100) 关键差异：
+
+                 Nano (Maxwell)       A100 (Ampere)
+─────────────────────────────────────────────────
+ CUDA 核心        128                  6912
+ Tensor Core      无                   有 (432 个)
+ FP16 支持        原生不支持 FP16     原生 FP16
+                  (走 FP32 CUDA core)
+ INT8 支持        DP4A 指令模拟       Tensor Core 原生 INT8
+ INT8 算力        低 (~0.9 TOPS)      高 (624 TOPS)
+ TRT 版本         8.x (JetPack 4.6+)   8.x+
+
+核心差异:
+  - Nano 没有 Tensor Core → INT8 加速没有服务器那么明显
+  - Nano 的 FP16 不是真正的 FP16 → 速度收益比服务器少
+  - Nano 的显存只有 4GB (共享内存) → 必须省着用</code></pre>
+
+        <p>
+          <strong>打个比方</strong>：Nano 的 GPU 是一把<strong>折叠小刀</strong>，
+          A100 是一把<strong>瑞士军刀</strong>——都是刀，都能切东西，
+          但小刀没有开瓶器(Tensor Core)、只能切软的(小模型)、手劲小了切不动(算力低)。
+          你服务器上学到的 TensorRT 技巧仍然有效，但收益会打折扣。
+        </p>
+
+        <h3>B.2 JetPack + TensorRT 环境搭建</h3>
+
+        <p>
+          Jetson Nano 上跑 TensorRT 的最大障碍不是代码，而是<strong>环境</strong>。
+          Nano 已经停产，官方推荐的替代是 Orin Nano，但存量 Nano 仍然很多，
+          面试时也经常被问到。
+        </p>
+
+        <pre><code># 环境一览
+
+# JetPack 4.6.1 (Nano 最后一个主流版本)
+# - Ubuntu 18.04
+# - CUDA 10.2
+# - cuDNN 8.2
+# - TensorRT 8.2.1
+# - OpenCV 4.1 (with CUDA)
+
+# 环境验证:
+nvcc --version          # CUDA 版本
+dpkg -l | grep tensorrt  # TRT 版本
+ls /usr/src/tensorrt/    # TRT samples
+
+# 关键: Nano 的内存是 CPU/GPU 共享的 4GB LPDDR4
+# 显存和系统内存是同一块
+# 所以 4GB 里要给系统和 GPU 各分一些</code></pre>
+
+        <p>
+          <strong>一个常见的安装坑</strong>：JetPack 里的 TensorRT 是通过 deb 包装的，
+          不是 pip install。所以 <code>import tensorrt</code> 在系统 Python3 里能直接用，
+          但如果你自己装了 conda / venv，库路径可能不对。
+          <strong>建议直接用系统 Python3</strong>。
+        </p>
+
+        <h3>B.3 PyTorch → ONNX → TensorRT</h3>
+
+        <p>
+          这部分跟服务器上流程完全一样，但要特别注意<strong>精度选择</strong>。
+          Maxell GPU 没有原生 FP16 支持（FP16 乘法和累加是在 FP32 core 上模拟的），
+          所以 FP16 在 Nano 上的加速收益<strong>远小于服务器</strong>。
+        </p>
+
+        <pre><code># 导出 ONNX (在 PC 上或 Nano 上都行)
+# 同一份 ONNX 可以分别构建 Nano 和 A100 的 engine
+
+# 在 Nano 上构建 engine:
+import tensorrt as trt
+
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+
+builder = trt.Builder(TRT_LOGGER)
+config  = builder.create_builder_config()
+
+# Nano 上推荐:
+# - 先试 FP16 (开启成本低，有一定收益)
+# - 如果 FP16 不够快再试 INT8
+config.set_flag(trt.BuilderFlag.FP16)
+
+# workspace 省着用 (Nano 只有 4GB)
+config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 512 << 20)  # 512MB
+
+network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+parser = trt.OnnxParser(network, TRT_LOGGER)
+parser.parse(open("yolov8n.onnx", "rb").read())
+
+# 序列化 engine (保存)
+engine = builder.build_serialized_network(network, config)
+open("yolov8n_nano_fp16.engine", "wb").write(engine)</code></pre>
+
+        <h3>B.4 Nano 上的关键注意事项</h3>
+
+        <p>
+          <strong>1. 只支持 EXPLICIT_BATCH</strong>。Nano 的 TRT 8.x 不再支持 implicit batch。
+          如果你的代码还用的是老写法，ONNX 解析时会报错。
+        </p>
+
+        <p>
+          <strong>2. FP16 不支持所有层</strong>。Maxwell GPU 上某些层（比如 Resize/Upsample）
+          在 FP16 下会回退到 FP32。这不是 bug，是硬件限制。构建 engine 时 TRT 会打印 warning，
+          <strong>但很多人没注意到这些 warning，上线后才发现某些层根本没加速</strong>。
+        </p>
+
+        <p>
+          <strong>3. engine 构建时间很长</strong>。Nano 构建 YOLOv8n FP16 engine 要 5~10 分钟，
+          INT8 要 15~25 分钟（包含了校准）。服务器上可能只要 30 秒。不要慌，这是正常的。
+        </p>
+
+        <p>
+          <strong>4. 不要开太多 context</strong>。Nano 的 4GB 共享内存非常紧张。
+          一个 YOLOv8n FP16 context 大概占 100~150MB 显存。
+          开 3 个 context 就 400MB 了，加上系统和显示，很容易 OOM。
+        </p>
+
+        <h3>B.5 Nano 端 C++ 推理</h3>
+
+        <p>
+          代码结构和服务端 TensorRT 完全一样，不过资源管理要更小心：
+        </p>
+
+        <pre><code>// Jetson Nano C++ 推理 (简化版)
+
+#include "NvInfer.h"
+#include "cuda_runtime_api.h"
+
+int main() {
+    // 1. 加载 engine
+    auto runtime = nvinfer1::createInferRuntime(gLogger);
+    auto engine  = runtime->deserializeCudaEngine(engine_data, engine_size);
+    auto context = engine->createExecutionContext();
+
+    // 2. 分配显存 (Nano 上要节俭)
+    int input_size  = 1 * 3 * 640 * 640;
+    int output_size = 1 * 84 * 8400;
+
+    void *d_input, *d_output;
+    cudaMalloc(&d_input,  input_size  * sizeof(float));
+    cudaMalloc(&d_output, output_size * sizeof(float));
+
+    float *h_input  = new float[input_size];
+    float *h_output = new float[output_size];
+
+    // 3. 推理
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    // 预处理 (在 CPU 上)
+    preprocess(img_ptr, h_input);  // resize + normalize + HWC→CHW
+
+    // H2D 拷贝
+    cudaMemcpyAsync(d_input, h_input, input_size * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+
+    // 推理
+    void *bindings[] = {d_input, d_output};
+    context->enqueueV3(stream);
+
+    // D2H 拷贝
+    cudaMemcpyAsync(h_output, d_output, output_size * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    // 后处理 (在 CPU 上)
+    std::vector&lt;Box&gt; boxes;
+    decode_output(h_output, boxes);
+    nms(boxes, 0.45);
+
+    // 4. 如果不继续用，释放
+    cudaStreamDestroy(stream);
+    cudaFree(d_input);
+    cudaFree(d_output);
+    delete[] h_input;
+    delete[] h_output;
+    delete context;
+    delete engine;
+    delete runtime;
+
+    return 0;
+}</code></pre>
+
+        <h3>B.6 看看 profile 数据</h3>
+
+        <pre><code>Jetson Nano + YOLOv8n 耗时分布（单帧 640×640）
+
+                   FP32          FP16          INT8 (DP4A)
+─────────────────────────────────────────────────────
+预处理 (CPU)         5.1ms         5.0ms         5.0ms
+H2D                  2.2ms         2.2ms         2.2ms
+推理 (GPU)          38.0ms        28.5ms        22.0ms      ← 加速肉眼可见
+D2H                  1.8ms         1.8ms         1.8ms
+后处理 (CPU)         5.3ms         5.3ms         5.3ms
+─────────────────────────────────────────────────────
+总计                 52.4ms        42.8ms        34.3ms
+                     ≈ 19fps       ≈ 23fps       ≈ 29fps</code></pre>
+
+        <p>
+          几个关键观察：
+        </p>
+
+        <ul>
+          <li>FP16 比 FP32 只快了 ~1.3 倍（服务器上这个数字是 1.8~2 倍）→ 因为没有 Tensor Core</li>
+          <li>INT8 比 FP16 又快了 ~1.3 倍（服务器上这个数字是 1.5~2 倍）→ DP4A 指令有收益但不及 Tensor Core</li>
+          <li>前后处理占了 ~10ms，占总耗时的 30%，说明<strong>Nano 上优化前后处理的收益占比比 RK3588 更大</strong></li>
+          <li>INT8 总延迟 34ms，离 30fps (33ms) 差一点点 → 需要继续优化</li>
+        </ul>
+
+        <p>
+          继续优化方向：
+        </p>
+
+        <pre><code>Nano 进一步优化后:
+
+GPU 前处理 (CUDA kernel)     █   0.3ms        ← 涨
+H2D                          █   0.5ms        ← 跟 GPU 前处理重叠
+推理 (INT8)                   ██████ 22.0ms
+D2H                          █   0.4ms        ← 跟后处理重叠
+GPU 后处理 (CUDA kernel)     █   0.5ms        ← 涨
+───────────────────────────────
+总计                             24.7ms  ≈ 40fps
+
+关键优化:
+- 前处理 GPU 化: 省了 4.7ms
+- 后处理 GPU 化: 省了 4.8ms (decode + NMS 在 GPU 上跑)
+- CUDA stream 重叠 H2D/D2H: 省了 1~2ms</code></pre>
+
+        <h2>两个平台并排对比</h2>
+
+        <pre><code>                     RK3588 (优化后)        Jetson Nano (优化后)
+───────────────────────────────────────────────────────────
+ 端到端延迟              14.3ms                  24.7ms
+ FPS                     70                      40
+ 推理精度                 瓶颈在 INT8 量化        INT8/FP16 可选
+ 优化难度                中 (黑盒工具链)          高 (自己写 CUDA kernel)
+ 工具链稳定性            中 (有时报看不懂的错)    好 (文档齐全)
+ 生态                    中文社区                 全球社区
+ 部署灵活性              低 (依赖 Rockchip)       高 (自己可控)
+ 单板成本                低 (~$120)               高 ($99 但停产)
+ 功耗                    低 (5~10W 带 NPU)        中 (5~10W 带 MAX)
+ 适合场景                大批量量产、成本敏感     原型验证、小批量、NVIDIA 技术栈已熟
+                        摄像头、门禁、智能家居    机器人、无人机、教育</code></pre>
+
+        <h2>高级工程师在面试里怎么讲这个对比</h2>
+
+        <p>
+          面试官如果问国产芯片部署经验，不要只背上面的对比表，要讲出
+          <strong>"我做了什么"和"我学到了什么"</strong>。
+        </p>
+
+        <h3>问题是："你在国产芯片上做过部署吗？"</h3>
+
+        <p>
+          一个可行的回答框架：
+        </p>
+
+        <pre><code>"做过。主要在 RK3588 上部署过 YOLOv8n 用于人脸检测门禁。"
+
+【这个框架不是让你背，是告诉你这类问题该怎么组织回答】
+
+1. 我做的：
+   从 PyTorch 到 RK3588 NPU 的完整部署链路。工具链是 RKNN，
+   流程是 PyTorch → ONNX → RKNN 量化 → 板端 C++ 推理。
+   目标场景是 30fps 实时检测，最终跑到了 70fps。
+
+2. 和 NVIDIA 平台的区别（这是面试官想听的）:
+   最大的区别是 RK3588 的 NPU 只支持 INT8，没有 FP16 fallback。
+   这意味着量化校准就必须一次做对。我们实际踩过的坑是
+   校准集覆盖不全导致夜间精度掉了 5 个点，后来加了夜间图片重训练
+   校准集解决了。
+
+   另外工具链上，RKNN 是闭源的，不像 TensorRT 能看到内部的
+   kernel 选择和融合策略。遇到报错只能查参数，没法看源码
+   debugging。这就要求对 ONNX 的算子兼容性非常清楚。
+
+3. 从这次经历学到的方法论:
+   不同硬件平台本质是在"算力、精度、灵活性"三者之间做权衡。
+   RK3588 选了算力和成本，牺牲了灵活性。Jetson 选了灵活性，
+   牺牲了成本。选型要看业务需要什么。
+
+   后来在 OCR 模型和关键点检测模型上复用了同一套"导出→量化→
+   校准→推理"的流水线。设备换了，但分析框架不变。</code></pre>
+
+        <h3>追问："RK3588 和 Jetson Nano 你会怎么选？"</h3>
+
+        <pre><code>看业务场景。给一个框架，不是死记结论：
+
+1. 先看预算和数量
+   量产 10 万片 → RK3588 (成本低 30~50%)
+   原型 10 台 → Jetson (开发快、TensorRT 经验可复用)
+
+2. 再看算法依赖
+   模型只有 Conv → RK3588 NPU 支持好
+   模型有自定义算子 / 需要 FP16 → Jetson
+   模型必须无损精度 → Jetson（INT8 掉精度时有 FP16 fallback）
+
+3. 再看长期维护
+   产品要迭代 → Jetson (工具链更成熟, 升级不 break)
+   产品定型不再改 → RK3588 (工具链锁定后没大问题)
+
+综合下来大多数量产场景 RK3588 性价比更高，
+但开发和维护成本要算进去。如果公司没有国产芯片部署经验，
+Jetson 的试错成本低很多。</code></pre>
+
+        <h2>每个平台独有的坑</h2>
+
+        <h3>RK3588 专有坑</h3>
+
+        <p>
+          <strong>1. ONNX opset 版本不兼容</strong>。
+          某个算子 ONNX opset 11 能跑，RKNN 可以正常解析；opset 17 同样的算子
+          RKNN 可能不认识。<strong>不是 ONNX 版本越新越好，是 RKNN 认什么你用什么</strong>。
+          试出来的安全版本：opset 11 或 12。
+        </p>
+
+        <p>
+          <strong>2. rknn.build() 会静默失败</strong>。
+          如果图里有不支持的算子，build 不会马上报错，而是<strong>跳过这个算子</strong>，
+          输出一个"看起来能跑"的 RKNN。等你跑到 NPU 推理时，这层的输出是随机的。
+          <strong>一定要做精度对比</strong>：用同一张图分别在 PyTorch 和 RKNN 上跑，
+          比较输出。
+        </p>
+
+        <pre><code># 精度对比脚本 (PC 端)
+
+import numpy as np
+
+# 1. PyTorch 输出
+pt_out = pytorch_model(torch_input)
+
+# 2. RKNN 输出 (rknn.inference 是 PC 端模拟 NPU)
+rknn_out = rknn.inference(inputs=[numpy_input])
+
+# 3. 对比
+diff = np.abs(pt_out - rknn_out)
+print(f"max diff:  {diff.max():.6f}")
+print(f"mean diff: {diff.mean():.6f}")
+
+# 正常情况: max diff &lt; 0.5, mean diff &lt; 0.05
+# 异常: max diff 好几千 → 有层被静默跳过了</code></pre>
+
+        <p>
+          <strong>3. 前处理和 NPU 期望的数据格式不一致</strong>。
+          RKNN 默认期望 NHWC 输入（不是 PyTorch 惯用的 NCHW），
+          而且 BGR 还是 RGB、归一化参数是多少，必须在 config 时跟预处理完全对齐。
+          对齐不好，哪怕你用同一个模型推理，结果也是错的。这不是 bug，是<strong>约定</strong>。
+        </p>
+
+        <p>
+          <strong>4. NPU 驱动版本绑定</strong>。
+          RK3588 的 NPU 固件（firmware）和 RKNN toolkit 的版本必须匹配。
+          RKNN toolkit 1.5.x → 板端 librknnrt.so 1.5.x。
+          版本不对，init 能过但 run 出随机结果。这个问题在新人身上出现频率极高，
+          因为没人告诉你版本要匹配。
+        </p>
+
+        <h3>Jetson Nano 专有坑</h3>
+
+        <p>
+          <strong>1. 共享内存的 4GB 上限</strong>。
+          Nano 的 CPU 和 GPU 共享 4GB LPDDR4。系统吃掉 1GB+，
+          桌面环境 500MB+，TRT engine + context + IO buffer 再吃 200~500MB。
+          留给应用程序的已经没多少了。如果还要跑第二个模型，大概率 OOM。
+          <strong>部署前先算显存预算</strong>。
+        </p>
+
+        <p>
+          <strong>2. Maxwell 没有 Tensor Core</strong>。
+          INT8 走的是 DP4A（dot product 4 accumulate）指令，不是 Tensor Core 的 MMA。
+          速度远不如服务器，FP16 也没有独立的 Tensor Core。如果你按服务器经验
+          去期待 Nano 的性能，会很失望。
+        </p>
+
+        <p>
+          <strong>3. JetPack 版本的 Python/CUDA/cuDNN/TensorRT 全部捆绑</strong>。
+          JetPack 是整体刷写，不能单独升级 TensorRT。
+          如果你的环境需要 TRT 8.6 但 JetPack 自带 8.2，要么换 JetPack 版本，
+          要么忍受旧版本。没有"apt upgrade tensorrt"。
+        </p>
+
+        <p>
+          <strong>4. engine 跨平台不兼容</strong>。
+          在 Nano 上构建的 engine 不能在 A100 上跑，反过来也不行。
+          必须在部署目标硬件上构建 engine。
+        </p>
+
+        <h2>两个平台的快速排障命令</h2>
+
+        <h3>RK3588</h3>
+
+        <pre><code># 1. 检查 NPU 是否正常
+cat /sys/kernel/debug/rknpu/load       # 负载百分比
+dmesg | grep -i rknpu                   # 驱动日志
+
+# 2. 检查 NPU 时钟频率
+cat /sys/kernel/debug/clk/clk_summary | grep npu
+
+# 3. 监控 NPU 使用率
+watch -n 0.5 cat /sys/kernel/debug/rknpu/load
+
+# 4. 查看可用内存 (RK3588 CPU/NPU 共享 DDR)
+free -h  # 至少留 1GB 给 NPU
+
+# 5. 如果 rknn_init 失败
+#    先检查 librknnrt.so 在不在
+find / -name "librknnrt.so" 2>/dev/null
+#    检查 glibc 版本
+ldd --version</code></pre>
+
+        <h3>Jetson Nano</h3>
+
+        <pre><code># 1. 查看 GPU 状态
+tegrastats          # 持续监控 GPU 利用率、功耗、温度
+# 输出: RAM 1854/3956MB GPU 82%@921MHz ...
+
+# 2. 查看 CUDA 相关信息
+nvcc --version
+nvidia-smi          # Nano 上这个输出比较简陋
+
+# 3. 检查 TensorRT
+dpkg -l | grep tensorrt
+
+# 4. 查看显存 / 内存 (Nano 上是同一块)
+free -h
+
+# 5. 温度监控 (Nano 容易降频)
+cat /sys/devices/virtual/thermal/thermal_zone*/temp
+# 除以 1000 得到摄氏度</code></pre>
+
+        <h2>总结</h2>
+
+        <p>
+          如果你从这篇文章只带走三件事：
+        </p>
+
+        <ol>
+          <li><strong>NVIDIA 到国产芯片的最大转变不是性能，是思维方式</strong>。
+              TensorRT 给你三个档位（FP32/FP16/INT8），国产 NPU 说"对不起，只有 INT8"。
+              你在服务端学到的 TensorRT 技巧仍然有用，但得重新学会<strong>在没有 fallback 的情况下调试</strong>。</li>
+          <li><strong>部署工程师的核心能力不是会用某个工具链，是能把任何工具链拆成同样的五层矩阵去分析</strong>。
+              硬件换了，模型换了，工具换了，但 profile → 找瓶颈 → 从外到内优化的方法论不变。
+              面试官真正在考察的是这个。</li>
+          <li><strong>国产芯片部署的门槛不是技术，是信息和生态</strong>。RKNN 的错误信息有时看不懂、
+              文档有滞后、社区答案少。经验积累主要靠踩坑 + 看别人的踩坑记录。
+              多跑、多记、多分享，是最快的成长路径。</li>
+        </ol>
+
+        <p>
+          下一篇可以展开两个方向：要么详细写 RK3588 上的 RKNN 前后处理 GPU 化
+          （用 RGA + DMA 做零拷贝 pipeline），要么写 Jeston Orin Nano
+          （Nano 的继任者，有 Tensor Core，体验会好很多）。
+          感兴趣哪个方向可以告诉我。
+        </p>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>A quiet blog.</p>
+    </footer>
+  </body>
+</html>

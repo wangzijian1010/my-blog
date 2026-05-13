@@ -6,7 +6,21 @@
     <link>https://wangzijian1010.github.io/my-blog/</link>
     <atom:link href="https://wangzijian1010.github.io/my-blog/feed.xml" rel="self" type="application/rss+xml" />
     <language>zh-CN</language>
-    <lastBuildDate>Mon, 11 May 2026 00:00:00 +0800</lastBuildDate>
+    <lastBuildDate>Tue, 12 May 2026 00:00:00 +0800</lastBuildDate>
+    <item>
+      <title>用 Nsight 看穿 TensorRT pipeline 的性能瓶颈</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/nsight-tensorrt-profiling.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/nsight-tensorrt-profiling.html</guid>
+      <description>从没碰过 Nsight 的人也能看懂的实战指南：Nsight Systems 和 Nsight Compute 分别干什么、怎么装、怎么跑、怎么看 timeline、怎么从 GPU 波形图里读出瓶颈并定位到具体代码。</description>
+      <pubDate>Tue, 12 May 2026 00:00:00 +0800</pubDate>
+    </item>
+    <item>
+      <title>YOLOv8n 在 RK3588 和 Jetson Nano 上的部署实战对比</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/yolov8n-rk3588-jetson-nano.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/yolov8n-rk3588-jetson-nano.html</guid>
+      <description>从 PyTorch 到板端推理，YOLOv8n 分别在瑞芯微 RK3588（RKNN NPU）和 Jetson Nano（TensorRT）上的完整部署流程、profile 数据、踩坑记录和面试话术。</description>
+      <pubDate>Tue, 12 May 2026 00:00:00 +0800</pubDate>
+    </item>
     <item>
       <title>拿到一个 CV pipeline，高级工程师是怎么拆解和优化的</title>
       <link>https://wangzijian1010.github.io/my-blog/posts/cv-deployment-optimization-roadmap.html</link>

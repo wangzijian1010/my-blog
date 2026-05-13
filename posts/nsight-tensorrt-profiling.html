@@ -1,0 +1,830 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>用 Nsight 看穿 TensorRT pipeline 的性能瓶颈 | 慢慢写</title>
+    <meta
+      name="description"
+      content="从没碰过 Nsight 的人也能看懂的实战指南：Nsight Systems 和 Nsight Compute 分别干什么、怎么装、怎么跑、怎么看 timeline、怎么从 GPU 波形图里读出瓶颈并定位到具体代码。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="用 Nsight 看穿 TensorRT pipeline 的性能瓶颈">
+    <meta property="og:description" content="从没碰过 Nsight 的人也能看懂的实战指南：Nsight Systems 和 Nsight Compute 分别干什么、怎么装、怎么跑、怎么看 timeline、怎么从 GPU 波形图里读出瓶颈并定位到具体代码。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/nsight-tensorrt-profiling.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../archive.html">Posts</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">profiling</p>
+          <h1>用 Nsight 看穿 TensorRT pipeline 的性能瓶颈</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-12">2026.05.12</time>
+            <span>Nsight</span>
+            <span>TensorRT</span>
+            <span>CUDA</span>
+            <span>Profiling</span>
+            <span>性能分析</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          之前听过 Nsight 但从没打开过？这篇是写给你的。
+          不讲原理讲操作——Nsight Systems 和 Nsight Compute 分别用来看什么、
+          怎么装、怎么跑第一条 profile、怎么从 GPU timeline 的波形图里一眼看出瓶颈在哪、
+          怎么把波形对应到自己的代码行。看完你至少能用 Nsight 回答三个问题：
+          我的 GPU 是真在算还是在闲着？哪个 kernel 最慢？为什么慢？
+        </p>
+
+        <h2>先搞清楚：为什么要用 Nsight，而不是继续 time.time()</h2>
+
+        <p>
+          你之前的博客里用 <code>time.time()</code> 测过 pre / infer / post 三段耗时。
+          这个方法能回答"总时间多少"，但回答不了这些问题：
+        </p>
+
+        <ul>
+          <li>模型推理 5ms，这 5ms 是在等数据搬完还是在等 GPU 算完？</li>
+          <li>H2D 拷贝和 kernel 执行有没有重叠？还是串行的？</li>
+          <li>TensorRT 的两个 context 在双 stream 上到底有没有真的并行？</li>
+          <li>50 个 kernel 里到底是哪一个占了 80% 的时间？</li>
+          <li>这个 kernel 慢是因为算力不够还是显存带宽不够？</li>
+        </ul>
+
+        <p>
+          <strong>打个比方</strong>：<code>time.time()</code> 就像你只知道"从家到公司花了 40 分钟"。
+          但 40 分钟里，到底是在高速上堵了 30 分钟？还是在家门口等电梯等了 20 分钟？
+          你不知道。Nsight 就是在你的车上装了 GPS 记录仪，能拉出一条时间线，
+          每秒在哪、在干什么，全部看见。
+        </p>
+
+        <p>
+          NVIDIA 给了两个工具，<strong>千万别混用</strong>：
+        </p>
+
+        <pre><code>┌─────────────────────────────────────────────────────────────┐
+│                    Nsight 两件套                              │
+├──────────────────┬──────────────────────────────────────────┤
+│                  │                                            │
+│  Nsight Systems  │  Nsight Compute                           │
+│  (nsys / nsys-ui)│  (ncu / ncu-ui)                           │
+│                  │                                            │
+│  看"什么时候"     │  看"为什么"                                 │
+│  宏观时间线       │  微观单个 kernel                           │
+│                  │                                            │
+│  回答:            │  回答:                                     │
+│  GPU 在干嘛？     │  这个 kernel 为什么慢？                      │
+│  哪里有空泡？     │  是计算瓶颈还是访存瓶颈？                     │
+│  kernel 顺序对？  │  SM occupancy 多少？                        │
+│  H2D/D2H 重叠了？ │  有没有 bank conflict？                     │
+│                  │                                            │
+│  好比:             │  好比:                                     │
+│  卫星地图看全城路况 │  放大镜看一个路口的红绿灯配时                 │
+│                  │                                            │
+└──────────────────┴──────────────────────────────────────────┘</code></pre>
+
+        <p>
+          实战中的使用顺序永远是：<strong>先用 Nsight Systems 定位哪个 kernel / 哪个阶段慢，
+          再用 Nsight Compute 放大那个 kernel 看为什么慢</strong>。
+          反过来做就是在浪费时间——你可能在优化一个占总耗时 2% 的 kernel。
+        </p>
+
+        <h2>Nsight Systems：安装和第一次运行</h2>
+
+        <h3>安装</h3>
+
+        <p>
+          Nsight Systems 有两种安装方式，推荐第一种：
+        </p>
+
+        <pre><code># 方式 1: 独立安装 (推荐)
+# 从 NVIDIA 官网下载 .deb/.rpm/.run
+# https://developer.nvidia.com/nsight-systems
+# 装完之后 CLI 和 GUI 都有
+
+# 方式 2: CUDA Toolkit 自带 (版本可能老)
+# 在 /usr/local/cuda/bin/ 下面
+ls /usr/local/cuda/bin/nsys*</code></pre>
+
+        <p>
+          <strong>一个很多人都不知道的事</strong>：Nsight Systems 的 CLI 工具
+          <code>nsys</code> 完全可以独立使用，不需要 GUI。你在服务器上跑、
+          把 <code>.nsys-rep</code> 文件下载到本地用 GUI 看就行。生产环境不需要装 GUI。
+        </p>
+
+        <h3>第一次运行</h3>
+
+        <pre><code># 最简单的跑法: 包住你的程序
+nsys profile --stats=true ./your_trt_inference
+
+# 如果你想指定输出文件名:
+nsys profile -o my_profile ./your_trt_inference
+
+# 如果你的程序需要 sudo (比如用了某些硬件):
+nsys profile --stats=true sudo ./your_trt_inference
+
+# 跑完之后会生成 my_profile.nsys-rep
+# 把这个文件拉到本地，双击用 Nsight Systems GUI 打开</code></pre>
+
+        <p>
+          <strong>但这么跑有个问题</strong>：它会记录整个程序的所有 CUDA / CPU 活动。
+          如果你的程序包含了模型加载、预热、循环推理 1000 次，nsys-rep 文件会很大。
+          <strong>应该只抓你最关心的那一段</strong>。
+        </p>
+
+        <h3>只抓关键段：用 NVTX 标记</h3>
+
+        <p>
+          NVTX（NVIDIA Tools Extension）就是个<strong>代码里的书签</strong>。
+          你在代码里标一下"推理开始"和"推理结束"，profile 里就能一眼看到这段。
+          标记的方法巨简单，只需要 include 一个头文件：
+        </p>
+
+        <pre><code>// C++ 代码里加 NVTX 标记
+
+#include "nvtx3/nvToolsExt.h"   // 只需要这一个头文件，零依赖
+
+int main() {
+    // ... 加载模型、预热 ...
+
+    // 只抓这 100 次推理
+    for (int i = 0; i &lt; 100; i++) {
+        nvtxRangePushA("inference_loop");  // 黄色标记：推理开始
+        preprocess(img);
+        context->enqueueV3(stream);
+        postprocess(output);
+        nvtxRangePop();                     // 黄色标记结束
+    }
+}
+
+// 或者给不同阶段打不同颜色的标记:
+void run_inference() {
+    nvtxRangePushA("preprocess");    // 前处理
+    // ...
+    nvtxRangePop();
+
+    nvtxRangePushA("inference");     // GPU 推理
+    context->enqueueV3(stream);
+    nvtxRangePop();
+
+    nvtxRangePushA("postprocess");   // 后处理
+    // ...
+    nvtxRangePop();
+}</code></pre>
+
+        <p>
+          Python 里也一样简单：
+        </p>
+
+        <pre><code># Python NVTX (需要 pip install nvtx)
+import nvtx
+
+with nvtx.annotate("preprocess", color="blue"):
+    x = preprocess(img)
+
+with nvtx.annotate("inference", color="red"):
+    y = model(x)
+
+with nvtx.annotate("postprocess", color="green"):
+    boxes = postprocess(y)</code></pre>
+
+        <blockquote>
+          NVTX 是免费的，头文件只有几十 KB，不影响性能。加上之后你在 Nsight Systems 的
+          timeline 上能看到彩色的标记条，打开文件一眼就能找到你要看的那段。
+          <strong>不加 NVTX 的 profile 跟看没有图例的地图一样</strong>。
+        </blockquote>
+
+        <h2>打开 nsys-rep：timeline 上到底能看到什么</h2>
+
+        <p>
+          用 Nsight Systems GUI 打开 <code>.nsys-rep</code>，你会看到类似这样的界面。
+          不需要知道每个按钮，你只需要关注<strong>这三行</strong>：
+        </p>
+
+        <pre><code>Nsight Systems Timeline (你需要关注的三行):
+
+OS Runtime  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+            ↑ 操作系统的 API 调用 (cudaMemcpy, cudaLaunchKernel...)
+
+CUDA API   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+            ↑ CUDA 用户态 API 调用 (这些是 host 端的)
+
+CUDA Kernels  ████████  ██████  ████████  ███████
+              ↑ GPU 上实际执行的 kernel (这是 device 端)
+              ↑ 这一行才是真相：GPU 到底在不在干活
+
+CUDA Memcpy    ▓▓    ▓▓      ▓▓    ▓▓
+              ↑ H2D / D2H 数据搬运</code></pre>
+
+        <p>
+          等等，为什么 OS Runtime 和 CUDA API 还有区别？因为<strong>CUDA 的很多 API 调用
+          在 OS Runtime 层还有一层转换</strong>。不过初学不用纠结这个，关注
+          <strong>CUDA Kernels 那一行</strong>就够了。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：CUDA Kernels 这一行是<strong>工地本身</strong>——
+          能看到工人什么时候在砌墙、什么时候在休息。
+          CUDA Memcpy 是<strong>卡车</strong>——运砖的。
+          CUDA API 和 OS Runtime 是<strong>包工头手里的对讲机</strong>——
+          能看到他什么时候在下指令，但下指令不等于工人立刻动手。
+        </p>
+
+        <h2>四种典型 timeline，一眼看出来瓶颈在哪</h2>
+
+        <p>
+          打开 profile 之后，99% 的情况你能在 10 秒内看出属于下面四种之一。
+          这四种波形图就是你的<strong>诊断图鉴</strong>。
+        </p>
+
+        <h3>模式 1：健康（GPU 全程在跑）</h3>
+
+        <p>
+          这是理想状态。<strong>GPU 不闲着，H2D/D2H 和 kernel 重叠</strong>。
+        </p>
+
+        <pre><code>时间 →
+
+CUDA Kernels  ████████████████████████████████████████
+              │← kernel 1 →│←   kernel 2   →│← ker3 →│
+
+CUDA Memcpy    ▓▓                ▓▓
+  (H2D)       │copy in│         │copy in│
+
+CUDA Memcpy                     ▓▓                ▓▓
+  (D2H)                        │copy out│        │copy out│
+
+特征:
+  ✓ Kernel 行几乎不间断
+  ✓ Memcpy 跟 kernel 在时间上重叠（并行执行）
+  ✓ 没有大面积空白
+
+结论: GPU 利用得很好，瓶颈大概率是 kernel 算力本身
+      → 下一步用 Nsight Compute 看最长的 kernel 能不能优化</code></pre>
+
+        <h3>模式 2：GPU 在等人（大量空洞）</h3>
+
+        <p>
+          <strong>最常见的病态 timeline</strong>。kernel 之间有大片空白，
+          空白 = GPU 在等 CPU。
+        </p>
+
+        <pre><code>CUDA Kernels  ████          ████          ████
+              │ k1 │        │ k2 │        │ k3 │
+
+CUDA Memcpy    ▓▓            ▓▓            ▓▓
+
+               ↑ 空洞         ↑ 空洞         ↑ 空洞
+
+CPU 线程 (另一个视图):
+              ░░░░░░░░░░░░  ░░░░░░░░░░░░  ░░░░░░░░░░░░
+              预处理           NMS            画框
+
+诊断:
+  空洞的时间 ≈ CPU 预处理/后处理的时间
+  → GPU 等 CPU 把下一帧数据准备好
+  → 瓶颈不在 GPU，在 CPU 前后处理
+
+解决:
+  ✓ GPU 化前后处理 (把 CPU 工作搬到 CUDA kernel)
+  ✓ 用多线程流水线 (CPU 处理帧 N+1 时 GPU 算帧 N)
+  ✓ 用 CUDA stream 让拷贝和计算重叠</code></pre>
+
+        <p>
+          <strong>怎么在 Nsight Systems 里验证这个诊断</strong>：在左边栏的 "Threads" 视图里
+          找到你的主线程，展开看 CPU 那段空白是不是在跑 <code>cv::resize</code>、
+          <code>cv::cvtColor</code> 之类的 OpenCV 函数。如果是，问题确认。
+        </p>
+
+        <h3>模式 3：GPU 在等搬运工（Memcpy 和 kernel 串行）</h3>
+
+        <p>
+          H2D/D2H 数据拷贝跟 kernel 执行<strong>没有重叠</strong>，全部串行。
+        </p>
+
+        <pre><code>CUDA Kernels                  ████████████
+                              │  kernel  │
+
+CUDA Memcpy    ▓▓▓▓▓▓▓▓▓▓                      ▓▓▓▓▓▓▓▓▓▓
+  (H2D)       │ copy in │                      │ copy in │
+                                   ↑
+                              拷贝完才开始算
+
+CUDA Memcpy                            ▓▓▓▓▓▓▓▓▓▓
+  (D2H)                               │copy out│
+
+诊断:
+  H2D → kernel → D2H 串成一条线，没有任何重叠
+  → 用了默认 stream 或者 pageable memory
+  → cudaMemcpy 而不是 cudaMemcpyAsync
+
+解决:
+  ✓ 换成 cudaMallocHost (pinned memory) + cudaMemcpyAsync
+  ✓ 给拷贝和计算分配不同的 CUDA stream
+  ✓ 确认没有隐式的 cudaDeviceSynchronize()</code></pre>
+
+        <p>
+          <strong>验证方法</strong>：在 Nsight Systems 里右键点击一个 cudaMemcpy 事件，
+          选 "Show in CUDA API view"，看它是 <code>cudaMemcpy</code> 还是
+          <code>cudaMemcpyAsync</code>。如果是前者，打自己一巴掌然后改代码。
+        </p>
+
+        <p>
+          <strong>再细一点说</strong>：即使你用了 <code>cudaMemcpyAsync</code>，
+          如果你的 host memory 是普通 <code>malloc</code> 出的 pageable memory，
+          底层仍然可能同步阻塞。必须用 <code>cudaMallocHost</code> 出 pinned memory。
+          Nsight Systems 不会直接告诉你"你用的是 pageable memory"，
+          但你能从 timeline 上看到"明面上是 async，实际全是串行"，这就是间接证据。
+        </p>
+
+        <h3>模式 4：kernel 碎片化（太多小 kernel）</h3>
+
+        <p>
+          TensorRT 已经做了大量融合，但如果图里有 TRT 没法融合的算子
+          （比如你写的 plugin、某些奇怪的后处理），就会出现几十上百个小 kernel。
+        </p>
+
+        <pre><code>CUDA Kernels  █ █ ██ █ ███ ██ █ ██ █ ███ █ ██ █ █
+              │↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑│
+              每个小竖条是一个 kernel，每个 launch 开销 5-20μs
+              50 个 kernel = 250-1000μs 纯浪费在 launch 上
+
+诊断:
+  kernel 很多很碎，每个都很短 (< 10μs)
+  → kernel launch overhead 占了显著比例
+  → TensorRT 融合没覆盖这些算子
+
+解决:
+  ✓ 检查 ONNX 导出时 opset 是否够新（新 opset → TRT 能识别更多模式）
+  ✓ 手写 CUDA kernel 把几个小算子合并
+  ✓ 用 CUDA Graph capture 把整段 capture 成一个 graph
+     → 之后一次 cudaGraphLaunch 提交全部，消除 launch 开销</code></pre>
+
+        <p>
+          在 Nsight Systems 里你可以<strong>数一下 CUDA Kernels 行的小竖条数量</strong>。
+          YOLOv8n 经过 TensorRT 融合后应该只有 10~20 个 kernel，如果看到 50+ 个，
+          说明有很多算子没被融合。
+        </p>
+
+        <blockquote>
+          <strong>四种模式的速查口诀</strong>：<br>
+          满格 → GPU 打满了，好；<br>
+          空洞 → GPU 等 CPU，做 GPU 化前后处理；<br>
+          串行 → 拷贝没重叠，上 pinned memory + async；<br>
+          碎片 → kernel 太碎，上 CUDA Graph 或手写融合 kernel。
+        </blockquote>
+
+        <h2>实际案例：用 Nsight Systems 给一个 YOLOv8n pipeline 看病</h2>
+
+        <p>
+          下面用一个具体例子把上面的概念串起来。
+        </p>
+
+        <p>
+          场景：YOLOv8n TensorRT FP16，在 4060 上跑，单帧 <code>time.time()</code>
+          测出来是 8ms。业务要求 3ms，差 2.7 倍。哪来的？
+        </p>
+
+        <p>
+          <strong>第一步：在代码里加 NVTX 标记，然后 nsys profile</strong>
+        </p>
+
+        <pre><code>// 加了 NVTX 标记的代码
+
+void detect(cv::Mat &frame) {
+    nvtxRangePushA("full_pipeline");
+
+    nvtxRangePushA("preprocess");
+    preprocess(frame, h_input);           // CPU resize + normalize
+    nvtxRangePop();
+
+    nvtxRangePushA("h2d");
+    cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice);
+    nvtxRangePop();
+
+    nvtxRangePushA("inference");
+    context->enqueueV3(stream);
+    nvtxRangePop();
+
+    nvtxRangePushA("d2h");
+    cudaMemcpy(h_output, d_output, out_size, cudaMemcpyDeviceToHost);
+    nvtxRangePop();
+
+    nvtxRangePushA("postprocess");
+    decode_and_nms(h_output, boxes);      // CPU 解码 8400 个 anchor + NMS
+    nvtxRangePop();
+
+    nvtxRangePop();  // full_pipeline
+}</code></pre>
+
+        <pre><code># 跑 profile
+nsys profile --stats=true -o yolo_diagnosis ./yolo_inference
+
+# 把 yolo_diagnosis.nsys-rep 拉到本地
+# 用 Nsight Systems GUI 打开</code></pre>
+
+        <p>
+          <strong>第二步：打开 timeline，看到了什么</strong>
+        </p>
+
+        <pre><code>实际 timeline (展开 NVTX 标记后):
+
+NVTX ─ full_pipeline ─────────────────────────────────────────
+NVTX   ─ preprocess ──               ─ postprocess ──
+NVTX                  ─ h2d ─                        ─ d2h ─
+NVTX                         ─ inference ─
+
+CUDA Kernels                   █  ← 只有推理这一小段！
+
+CUDA Memcpy (H2D)              ▓    ← 0.3ms
+CUDA Memcpy (D2H)                    ▓  ← 0.3ms
+
+                              ↑↑↑
+                          推理只占 1.2ms
+                          空洞有 5ms！
+
+CPU 线程展开:
+[preprocess: cv::resize + cvtColor + normalize]  ░░░░░  4.5ms
+[推理相关 API 调用]                                ▓  0.2ms
+[postprocess: for-loop 8400 anchors + NMS]      ░░░░░  3.8ms</code></pre>
+
+        <p>
+          <strong>第三步：诊断——模式 2，GPU 在等 CPU</strong>
+        </p>
+
+        <p>
+          NVTX 那几行把真实分布暴露得清清楚楚：
+        </p>
+
+        <pre><code>阶段          耗时      占比     在哪执行
+─────────────────────────────────────────
+preprocess    4.5ms     50%     CPU    ← 大头！
+inference     1.2ms     13%     GPU    ← 不是瓶颈
+postprocess   3.8ms     42%     CPU    ← 也是大头
+H2D/D2H       0.6ms      7%     PCIe
+─────────────────────────────────────────
+重叠部分       -1.1ms           (H2D 和 pre 后半段有重叠)
+─────────────────────────────────────────
+总计          8.0ms    100%</code></pre>
+
+        <p>
+          没有 Nsight，你看到的就是 "8ms"。有了 Nsight，你看出来：<strong>推理才 1.2ms，
+          前后处理占了 8.3ms</strong>。瓶颈根本不在 GPU 上。
+        </p>
+
+        <p>
+          <strong>第四步：行动</strong>
+        </p>
+
+        <pre><code>优先级 1: 前处理 GPU 化
+  cv::resize + cvtColor + normalize + HWC→CHW
+  → 写成一个 CUDA kernel，省 4.5ms
+  预估收益: 4.5ms → 0.2ms
+
+优先级 2: 后处理 GPU 化
+  decode 8400 anchor + NMS 在 GPU 上跑
+  预估收益: 3.8ms → 0.3ms
+
+优化后 timeline (预期):
+CUDA Kernels  ████████████████████████████████  ← 连续了！
+              前处理GPU kernel + TRT推理 + 后处理GPU kernel
+
+总计预估: 0.2 + 1.2 + 0.3 + 0.2(H2D/D2H overlap) ≈ 1.9ms
+从 8ms → 1.9ms，提速 4.2 倍</code></pre>
+
+        <p>
+          这个例子说明：<strong>Nsight 的最核心价值，是让你在 30 秒内看完 1 小时的 debug</strong>。
+          没有 Nsight，你可能花一天去换 INT8、调 engine 参数、换更大的 GPU——
+          但 timeline 一看就知道，根因不在推理。
+        </p>
+
+        <h2>进阶：跟踪 CUDA stream 的并行度</h2>
+
+        <p>
+          前面提到过用多 stream 让 source 和 target 并行。你在代码里开了两个 stream，
+          写了双 context，<strong>但它们在 GPU 上真的在并行吗</strong>？
+          Nsight Systems 能直接回答这个问题。
+        </p>
+
+        <p>
+          在 Nsight Systems 的 CUDA Kernels 行，你可以按 stream 分组显示：
+        </p>
+
+        <pre><code>CUDA Kernels (按 stream 分组):
+
+stream 13 (source 链路):
+  ████████████████          ████████████████
+  face_detect_src            face_recognizer
+
+stream 14 (target 链路):
+          ████████████████          ████████
+          face_detect_tgt            face_landmarks_tgt
+
+           ↑ 真重叠！           ↑ 也重叠！
+
+特征:
+  ✓ 两个 stream 在时间上真正并行了
+  ✓ GPU SM 有足够资源同时跑两路
+
+如果没并行，timeline 长这样：
+stream 13: ████████████████                    ████████████████
+stream 14:                   ████████████████                   ████████████████
+                            ↑ 错开了，说明在串行排队
+
+串行的可能原因:
+  ✗ 两个 stream 共享了同一个 context (context 串行化)
+  ✗ 有一个隐式的 cudaDeviceSynchronize 调用
+  ✗ 两个 enqueueV3 用了默认 stream (NULL stream 有隐式同步)</code></pre>
+
+        <p>
+          <strong>怎么查隐式同步</strong>：在 Nsight Systems 的 CUDA API 行里，
+          如果看到 <code>cudaDeviceSynchronize</code> 或者 <code>cudaStreamSynchronize</code>
+          调用出现在你不期望的地方，这就是隐式同步的根因。
+          右键点这个事件 → "Show in source view" 能直接跳到你代码里的那一行。
+        </p>
+
+        <h2>Nsight Compute：放大一个 kernel 解剖它</h2>
+
+        <p>
+          用 Nsight Systems 定位到了最慢的 kernel，接下来用 Nsight Compute
+          看<strong>它为什么慢</strong>。Nsight Compute 是更底层的工具，
+          能看到一个 kernel 内部的 SM 利用率、显存带宽、warp 调度等。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：Nsight Systems 是卫星地图，告诉你"第三大街在堵车"。
+          Nsight Compute 是你在第三大街下车的交警，看"堵车是因为红绿灯配时不对，
+          还是最前面有辆车抛锚了"。
+        </p>
+
+        <h3>安装和第一次运行</h3>
+
+        <pre><code># 独立安装
+# https://developer.nvidia.com/nsight-compute
+
+# CLI: ncu
+ncu --version
+
+# 最简单的跑法:
+ncu ./your_program
+
+# 但这样会抓所有 kernel，输出爆炸
+# 应该只抓你最关心的那个 kernel:</code></pre>
+
+        <pre><code># 方法 1: 指定 kernel 名字 (正则匹配)
+ncu --kernel-name "my_kernel" ./your_program
+
+# 方法 2: 只抓前 5 个 kernel
+ncu --launch-count 5 ./your_program
+
+# 方法 3: 跳过前 N 个 kernel (比如跳过前面预热/初始化的)
+ncu --launch-skip 100 --launch-count 5 ./your_program
+
+# 方法 4: 用 NVTX 范围来限定 (推荐！)
+ncu --nvtx --nvtx-include "inference" ./your_program
+# ↑ 只抓 NVTX 标记为 "inference" 的范围内的 kernel</code></pre>
+
+        <h3>Nsight Compute 报告里最关键的 5 个指标</h3>
+
+        <p>
+          跑完之后会输出一份很长的报告。初学者看到满屏数字肯定懵。
+          其实你只需要看 5 个数：
+        </p>
+
+        <pre><code>┌─────────────────────────────────────────────────────────────┐
+│                Nsight Compute 核心指标速查                    │
+├────────────────────┬────────────────────────────────────────┤
+│  指标              │  什么意思                               │
+├────────────────────┼────────────────────────────────────────┤
+│                    │                                         │
+│  Compute           │  SM 计算单元的利用率                     │
+│  Throughput (%)    │  高 (>60%) = 计算瓶颈, 考虑减计算量      │
+│                    │  低 (<40%) = SM 空闲多, 不是计算问题      │
+│                    │                                         │
+│  Memory            │  显存带宽利用率                          │
+│  Throughput (%)    │  高 (>60%) = 带宽瓶颈, 考虑搬少一点数据   │
+│                    │  低 (<40%) = 带宽不是瓶颈                 │
+│                    │                                         │
+│  Occupancy (%)     │  每个 SM 上同时有多少 warp 在干活         │
+│                    │  高 (>75%) = warp 够多, 延迟被隐藏         │
+│                    │  低 (<50%) = warp 太少, SM 在等数据       │
+│                    │                                         │
+│  Registers         │  每个线程用了多少个寄存器                  │
+│  per Thread        │  太多 (>128) 会降低 Occupancy            │
+│                    │                                         │
+│  Shared Memory     │  每个 block 用了多少 shared memory        │
+│  per Block         │  太多会降低 Occupancy                    │
+│                    │                                         │
+└────────────────────┴────────────────────────────────────────┘</code></pre>
+
+        <p>
+          <strong>怎么用这 5 个数做诊断</strong>：
+        </p>
+
+        <pre><code>场景 1: Compute Throughput 高 + Memory Throughput 低
+  → 计算瓶颈。kernel 做太多运算了。
+  → 解法: 减 FLOPs (换轻量模型、减通道数、减输入尺寸)
+
+场景 2: Compute Throughput 低 + Memory Throughput 高
+  → 显存带宽瓶颈。搬运数据花的时间比计算还多。
+  → 解法: 用 INT8/FP16 减少数据量、增加数据复用、
+           用 shared memory 缓存、减少 kernel 的输入/输出数量
+
+场景 3: 两个都低 + Occupancy 低
+  → kernel 配置不好。每个 SM 上 warp 不够多, GPU 调度不过来。
+  → 解法: 调整 block size / grid size、减少寄存器用量、
+           减少 shared memory 用量 (这两个会限制最大 warp 数)
+
+场景 4: 两个都低 + Occupancy 高
+  → kernel 本身没什么问题, 可能是 kernel launch overhead 太大
+     (太多小 kernel), 或者前面 kernel 的输出还没算完
+  → 解法: 回 Nsight Systems 看 timeline, 可能根本不该优化这个 kernel</code></pre>
+
+        <h3>实战：分析一个 YOLOv8n TensorRT 卷积 kernel</h3>
+
+        <p>
+          先用 Nsight Systems 找到最长那个 kernel（比如 TRT 融合后的
+          CBR kernel，占推理时间 30%），然后用 ncu 分析它：
+        </p>
+
+        <pre><code># 在 Nsight Systems 里找到 kernel 名字 (比如 "tensorrt_fused_conv_0")
+# 然后在 Nsight Compute 里指定它:
+
+ncu \
+  --kernel-name "tensorrt_fused_conv_0" \
+  --set full \
+  -o conv_profile \
+  ./yolo_inference
+
+# 打开 conv_profile.ncu-rep (用 Nsight Compute GUI)</code></pre>
+
+        <p>
+          看到报告：
+        </p>
+
+        <pre><code>tensorrt_fused_conv_0 的分析结果:
+
+Compute Throughput:   38%     ← 偏低, SM 没吃满
+Memory Throughput:    72%     ← 高, 带宽是瓶颈！
+Occupancy:            48%     ← 偏低
+
+解读:
+  这个 kernel 在等显存搬运数据, 计算单元在空转。
+  GPU 大部分时间在从 HBM 读 weight 和 activation。
+
+为什么 Occupancy 低？
+  展开看 Memory Workload Analysis:
+  - L1 cache hit rate: 32%    ← L1 没命中很多
+  - L2 cache hit rate: 58%    ← L2 也没命中很多
+  → 大量访问直接从 HBM 走, 延迟长, SM 在等
+
+  再看 Registers per Thread: 96
+  → 寄存器用得比较多, 限制了每个 SM 上的 block 数量
+
+怎么办:
+  1. 先试 INT8 量化 → 数据量 1/4, 带宽直接省 3/4
+     → Memory Throughput 预期从 72% 降到 18%, Compute 能从 38% 升到 60%+
+  2. 如果有源码权限, 考虑调一下 shared memory 的使用策略
+  3. 如果这是 TRT 自己生成的 kernel, 没有源码 → 量化是唯一路</code></pre>
+
+        <p>
+          上面这个分析流程，面试时如果有人问"你用过 Nsight Compute 吗"——
+          <strong>你把 Compute Throughput / Memory Throughput / Occupancy 这三个数
+          以及"根据这三个数的关系判断瓶颈类型"的逻辑讲一遍，面试官就知道你真用过</strong>。
+        </p>
+
+        <blockquote>
+          提示：上面这个例子里的 kernel 名字、百分比数字是为了教学编的，
+          真实 TRT kernel 的名字不会叫 "tensorrt_fused_conv_0"，
+          会是一堆看起来像乱码的 TRT internal kernel 名。
+          但分析逻辑完全一样——先看 Compute / Memory / Occupancy 三个数。
+        </blockquote>
+
+        <h2>常见坑：Nsight 新手反复踩的</h2>
+
+        <h3>1. 用 Nsight Compute 看了所有 kernel</h3>
+
+        <p>
+          一个 YOLOv8n 推理可能涉及 15 个 CUDA kernel。不加过滤地 ncu 跑，
+          输出几百页报告。你根本看不完。<strong>先用 nsys 定位最慢 kernel，
+          再用 ncu 只看那一个</strong>。
+        </p>
+
+        <h3>2. 在容器里跑 ncu 没权限</h3>
+
+        <p>
+          Nsight Compute 需要访问 GPU 的 perf counter，默认 Docker 容器没权限。
+        </p>
+
+        <pre><code># 正确的 docker run 参数:
+docker run --gpus all --cap-add=SYS_ADMIN \
+  --privileged \
+  your_container ncu ./your_program</code></pre>
+
+        <h3>3. nsys/ncu 跑完没有输出 GPU 信息</h3>
+
+        <p>
+          通常是 GPU 驱动版本和 Nsight 版本不匹配。Nsight 2024.x 需要 R535+ 驱动。
+          如果驱动太老，降 Nsight 版本到匹配的。
+        </p>
+
+        <h3>4. 用 Nsight profiler 跑出了不同的性能</h3>
+
+        <p>
+          Nsight 本身有开销（特别是 ncu，它要插桩每个 warp）。
+          用它跑出来的耗时比不跑时慢 10~50%。<strong>不要用 Nsight 测的绝对时间去跟别人说
+          "我的模型是 X ms"，这个数字是偏大的</strong>。
+          Nsight 给你的价值不在绝对时间，在于<strong>相对比例</strong>和<strong>瓶颈定位</strong>。
+        </p>
+
+        <h3>5. 在 GPU 已经在跑别的进程时做 profile</h3>
+
+        <p>
+          timeline 上会混入其他进程的 kernel，看不出哪些是你的。
+          <strong>确保 GPU 上没有其他进程</strong>：
+        </p>
+
+        <pre><code># profile 前确认 GPU 空闲
+nvidia-smi
+# 看 Processes 那一栏，除了你的程序不应该有任何东西</code></pre>
+
+        <h2>面试时怎么讲 Nsight 经验</h2>
+
+        <p>
+          面试官大概率不会直接问"你用过 Nsight 吗"，而是问"你怎么分析性能瓶颈"。
+          你应该把 Nsight 自然地嵌在回答里：
+        </p>
+
+        <pre><code>"我一般分两步。先用 Nsight Systems 跑一次端到端 profile，
+把 CUDA kernel 的 timeline 拉出来看三个东西：
+第一，GPU kernel 之间有没有大面积空白——如果有，瓶颈在 CPU；
+第二，H2D/D2H 和 kernel 有没有重叠——如果没重叠，改 pinned memory + async stream；
+第三，kernel 是不是太碎了——如果超过 30 个小 kernel，考虑 CUDA Graph。
+
+定位到最慢的 kernel 之后，再用 Nsight Compute 放大看。
+不看细节，就看三个数：Compute Throughput、Memory Throughput、Occupancy。
+根据这三个的高低组合能直接判断是计算瓶颈还是带宽瓶颈还是调度瓶颈。"
+
+↑ 这段话 30 秒讲完，面试官的判断就是"这个人是真做过 profiling 的"。</code></pre>
+
+        <p>
+          如果面试官追问 Occupancy 是什么，一句话就能搞定：
+        </p>
+
+        <p>
+          Occupancy = 每个 SM 上同时有多少个 warp 在干活。<br>
+          高 Occupancy → GPU 有足够的活可以随时切换着做，某个 warp 等数据时
+          另一个 warp 接着上。<br>
+          低 Occupancy → 每个 SM 上 warp 太少，一等数据就空转。
+        </p>
+
+        <p>
+          <strong>打个比方</strong>：Occupancy 就是<strong>厨房里同时有几个厨师</strong>。
+          一个厨师（低 Occupancy），锅在烧水的时候他就只能站着等。
+          8 个厨师（高 Occupancy），锅在烧水的时候他可以切菜、备料、炒别的，
+          时间不浪费。GPU 也是一样：多 warp = 等数据时换别的 warp 继续算 =
+          延迟被隐藏。
+        </p>
+
+        <h2>总结</h2>
+
+        <pre><code>Nsight 学习路径 (建议用 1-2 天走完):
+
+第 1 步 (30 分钟): 把你的 TRT 推理程序里加上 NVTX 标记
+第 2 步 (10 分钟): nsys profile 跑一次，导出 .nsys-rep
+第 3 步 (30 分钟): 用 GUI 打开，按 stream 分组看 timeline
+第 4 步 (10 分钟): 对号入座，判断是 4 种模式的哪一种
+第 5 步 (30 分钟): ncu 抓最慢的 kernel，看 Compute/Memory/Occupancy
+第 6 步 (10 分钟): 根据三个数字判断是该减计算、减带宽、还是调 kerenl 配置
+
+全部走完你就有一套自己的诊断方法了。
+后面每换一个新模型、换一个新平台，跑一遍这套 = 1 小时内定位瓶颈。</code></pre>
+
+        <p>
+          下一篇可以写一个完全实战的端到端案例——拿一个真实模型，从 PyTorch 原始代码
+          开始，加 NVTX、跑 nsys、按 timeline 定位瓶颈、写 CUDA kernel 优化、
+          跑 ncu 验证、再跑 nsys 对比优化前后。把一个完整的"profile → 诊断 → 优化 → 验证"
+          闭环走一遍。想要的话告诉我。
+        </p>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>A quiet blog.</p>
+    </footer>
+  </body>
+</html>
