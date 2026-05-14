@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>推理部署岗面试复盘：换脸算法、量化精度与那条没接住的国产芯片问题 | 慢慢写</title>
+    <meta
+      name="description"
+      content="一次推理部署岗的面试复盘：FaceFusion 四阶段并行化、FP16/INT8 量化精度排查、与算法组的协作边界，以及那条我没接住的端侧国产芯片问题。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="推理部署岗面试复盘：换脸算法、量化精度与那条没接住的国产芯片问题">
+    <meta property="og:description" content="一次推理部署岗的面试复盘：FaceFusion 四阶段并行化、FP16/INT8 量化精度排查、与算法组的协作边界，以及那条我没接住的端侧国产芯片问题。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/inference-deployment-interview-review.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../archive.html">Posts</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">interview review</p>
+          <h1>推理部署岗面试复盘：换脸算法、量化精度与那条没接住的国产芯片问题</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-14">2026.05.14</time>
+            <span>面试</span>
+            <span>复盘</span>
+            <span>推理部署</span>
+            <span>TensorRT</span>
+            <span>量化</span>
+            <span>端侧</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          一次面向音视频算法公司的推理部署岗面试。技术深度部分基本接住了，但有几个地方答得散，
+          有几个方向（INT8 真实落地、国产端侧芯片）明显是盲区。把整场聊天复盘一遍，
+          顺手把下次该怎么答、要补哪些功课，都列下来。
+        </p>
+
+        <h2>面试概况</h2>
+
+        <ul>
+          <li><strong>岗位方向</strong>：算法部署 / 推理优化，落地形态以端侧芯片为主，部分上 App。</li>
+          <li><strong>公司业务</strong>：音视频算法，自研 App + 端侧 SDK，主算力平台是国产 2–3T 算力的端侧芯片，App 侧偏高通 / MTK，<em>不做 GPU 服务端部署</em>。</li>
+          <li><strong>团队结构</strong>：部署 3–4 人，算法人数更多，部署同事不刻意区分算法 / 部署职责，希望能两边都摸。</li>
+          <li><strong>面试官关注点</strong>：项目深度、量化精度方法论、与算法同事的协作模式、对国产端侧的兴趣度。</li>
+          <li><strong>整体节奏</strong>：约 30 分钟，单面，技术 + HR 信息混合，没有写代码 / 手撕题。</li>
+        </ul>
+
+        <h2>题目一：换脸 pipeline 从 1.2s 优化到 0.25s，你做了什么</h2>
+
+        <p>
+          这是开场题，对应我简历上 FaceFusion 端到端推理优化那段。我大体讲了：
+          ONNX → TensorRT 转换、四阶段（face_detect / face_landmarks / face_swap / face_restoration）、
+          GFPGAN 那一层 FP16 溢出用 Polygraphy 定位、敏感层混合精度回退成 FP32、
+          source / target 两条链路用两个 TRT 实例并行、用 device 指针避免 H2D / D2H 反复拷贝。
+        </p>
+
+        <p>
+          内容是对的。问题在于<strong>结构不对</strong>。我是顺着脑子里的时间线讲下来的，
+          而不是按"瓶颈分析 → 优化动作 → 收益数据"的层级讲。听的人很难知道哪一步带来了多少收益，
+          也就没办法判断我是不是真的有"找瓶颈"的能力。
+        </p>
+
+        <blockquote>
+          1.2s → 0.25s 是一个结论数字，但我没拆给面试官看。下次必须先拆账，再讲动作。
+        </blockquote>
+
+        <h3>下次该怎么答（STAR + 拆账）</h3>
+
+        <ol>
+          <li><strong>Situation</strong>：领导要求把 Python 版 FaceFusion 部署到 C++ 本地，做视频换脸，延迟要尽量低。原始 Python pipeline 单帧约 1.2s。</li>
+          <li><strong>Task</strong>：在 N 卡平台上，把端到端延迟压到 250ms 以内，并且不能掉精度（人脸还原必须接受）。</li>
+          <li><strong>Action（按收益从大到小讲）</strong>：
+            <ol>
+              <li>ONNX → TensorRT，前三段开 FP16，face_restoration 因 GFPGAN 出现溢出，用 Polygraphy 逐层对比 ONNX-FP16 与 TRT-FP16，定位到精度敏感层，配置混合精度（敏感层 FP32，其余 FP16）。</li>
+              <li>用 CUDA kernel 替换 CPU 前后处理（resize / normalize / NMS / paste-back），把 1.1ms 量级的预处理拉到 0.2ms。</li>
+              <li>把 source / target 在 face_swap 之前的两条独立子图，拆成两个 TRT context + 两条 CUDA stream，并发执行。</li>
+              <li>整张图一次性 H2D，中间结果用 device 指针在 GPU 显存里流转，去掉链路中间所有的 H2D/D2H。</li>
+              <li>I/O FP16：图像张量本身从 FP32 改成 FP16 表示，单纯减少拷贝体积。</li>
+            </ol>
+          </li>
+          <li><strong>Result</strong>：单帧 1.2s → 0.25s，约 5× 收益，精度对齐算法组示例图基线，未掉点。</li>
+        </ol>
+
+        <p>
+          这套答法的关键不是新增信息，而是让"我懂得分析瓶颈、按收益排序、用数据说话"这三件事浮到表面。
+          内容我都说过，只是埋在了流水账里。
+        </p>
+
+        <h2>题目二：和算法组怎么配合</h2>
+
+        <p>
+          这题我答得还行。重点说了两件事：
+        </p>
+
+        <ol>
+          <li>交付形态分两种 —— C++ 集成在客户端软件里（我这边出 SDK），或者打包 Docker 给后端跑云推理。</li>
+          <li>遇到 ONNX 不支持的算子，要么我们写 TRT plugin，要么算法组用基础算子降级实现。我倾向于让算法组降级，因为自己手写 plugin 工程量大、性能也不一定比官方实现好（举的例子是 EfficientNMS_TRT）。</li>
+        </ol>
+
+        <p>
+          这一段是整场我自己最满意的：有取舍、有理由、有具体例子，体现了"工程师视角的协作判断"。
+          下次还可以再补一个小细节 —— 我们之间通常约一个<strong>共同的精度对齐脚本</strong>：算法给若干测试图，
+          两边各自跑，按像素级 / mAP / 主观打分对比，把"精度过线"这个事先达成共识。
+        </p>
+
+        <h2>题目三：INT8 用过吗？</h2>
+
+        <p>
+          这是我答得最虚的一题。实际情况：只在 YOLOv8 + 3080Ti 上做过实验，跑了 COCO，
+          mAP50 掉了 0.7 个点，纯推理时间和 FP16 几乎一样（3080Ti 上 INT8 加速很有限），
+          所以最终没上线。流程上我知道要校准集、要 calibrator，但<strong>没有完整的生产落地经验</strong>。
+        </p>
+
+        <p>
+          我说出来了"得不偿失就没用 INT8"，这点是诚实的，反而比硬吹要好。但<strong>缺的是后半句</strong>：
+          我没讲为什么 3080Ti INT8 收益小（Ampere 的 INT8 Tensor Core 加速对 batch=1 小模型本身就有限，
+          带宽往往才是瓶颈），也没讲在 Orin / 3090 / A100 上预期会不一样，
+          更没主动提<strong>什么场景下我会重新考虑 INT8</strong>（端侧低算力芯片、batch 大、内存带宽紧张时）。
+        </p>
+
+        <p>这正好是面试官真正想听的方向，因为他们做的就是端侧 2–3T 的芯片。我把球漏在了脚边。</p>
+
+        <h3>下次该怎么答</h3>
+
+        <ul>
+          <li>"成熟网络（YOLOv8）我做过完整的 FP32 → FP16 → INT8 实验，PTQ 流程用熵校准，COCO 上 mAP50 掉了 0.7。"</li>
+          <li>"在 3080Ti 上 INT8 不划算，是因为 Ampere 的 INT8 Tensor Core 对 batch=1 小模型的收益有限，瓶颈在带宽不在算力。"</li>
+          <li>"但如果是端侧 2–3T 算力的国产芯片，或者 Jetson Orin / Nano 这种 INT8 是一等公民的平台，INT8 几乎是必选项。"</li>
+          <li>"如果掉点接受不了，下一步我会考虑 QAT（量化感知训练），或者 percentile / MSE 校准代替熵校准，再或者对掉点最严重的几层做混合精度。"</li>
+        </ul>
+
+        <h2>题目四：让你做不掉精度的量化，你怎么和算法组聊</h2>
+
+        <p>
+          这题我答得方向对，但顺序乱。我大概讲了：先用 Polygraphy 排查敏感层，敏感层走高精度、不敏感层走低精度；
+          排查不过再请算法组换算子 / 写自定义算子。
+        </p>
+
+        <p>结构应该是这样：</p>
+
+        <ol>
+          <li><strong>对齐预期</strong>：先定 baseline 延迟和精度红线，明确"要省多少 ms、可以掉多少点"。没有预期就没有验收。</li>
+          <li><strong>逐级降精度</strong>：FP32 → FP16 → INT8，每一档都跑完精度回归，记录每档掉点。</li>
+          <li><strong>定位敏感层</strong>：哪一档开始掉点，用 Polygraphy <code>run --validate --atol --rtol</code> 逐层比对，锁定异常层。</li>
+          <li><strong>三种处方</strong>：
+            <ul>
+              <li>敏感层走混合精度回退（最便宜）。</li>
+              <li>校准集换策略：扩大校准集、按业务分布采样、试 percentile / MSE 校准。</li>
+              <li>还不行，就回到算法组：换算子实现、QAT 重训、或者只对那一段做知识蒸馏。</li>
+            </ul>
+          </li>
+          <li><strong>验收</strong>：算法组的对比脚本跑完，测试同事再以用户视角验一遍。</li>
+        </ol>
+
+        <p>
+          这套话术的核心是"我不是只会调参，我有一套可以和算法组共建的方法论"。
+          这一点比任何具体技术细节都重要 —— 部署岗的真正含金量就在协作面。
+        </p>
+
+        <h2>题目五：精度该从几个维度看</h2>
+
+        <p>
+          我答的是"上线红线优先，掉到红线以下就是无效优化"。这点没问题。
+          但其实精度可以拆得更细一点，下次可以这样讲：
+        </p>
+
+        <ul>
+          <li><strong>客观指标</strong>：mAP / PSNR / SSIM / 像素差等，能跑自动化脚本。</li>
+          <li><strong>主观指标</strong>：人脸还原、画质修复这类任务，必须有人主观打分，自动化指标不够。</li>
+          <li><strong>分布鲁棒性</strong>：测试集和真实业务输入分布是否一致；校准集如果偏了，线上会显著掉点。</li>
+          <li><strong>边缘 case</strong>：小目标、低光、极端角度，这些往往是量化第一刀砍下去的地方。</li>
+          <li><strong>稳定性</strong>：同一输入多次推理结果是否一致（FP16 在某些算子上是会跳的）。</li>
+        </ul>
+
+        <h2>题目六：参与的开源项目</h2>
+
+        <p>
+          这一段我答得偏弱。讲了"刚入职不会 C++ 所以去 GitHub 找学习资料、遇到了 lite.ai.toolkit、
+          后来给作者提了 PR、后来作者重心转 LLM 就把项目交给我维护、我加了 TensorRT 模块和 Docker 打包"。
+          内容是真实的，但<strong>没有量化贡献</strong>：加了多少模型、Star 增长、有没有用户在用、PR 数量、issue 处理数。
+        </p>
+
+        <p>
+          下次要准备好三个数字：<strong>commit 数 / Star 数 / 贡献的模型条数</strong>。
+          开源经历是简历上的"信号"，而面试就是把信号转成"证据"的场合。
+        </p>
+
+        <h2>那条我没接住的关键问题：国产端侧芯片</h2>
+
+        <p>
+          面试官原话大意："我们这边大概率用国产端侧芯片，2–3T 算力，比如 RK 系列、黑芝麻，
+          App 侧用高通 MTK；GPU 这边我们目前没做。你有兴趣吗，还是还是想往 N 卡 GPU 方向走？"
+        </p>
+
+        <p>
+          我答的是"有兴趣，碰过 Jetson Nano 两三次，国产芯片接触少"。
+          这是个<strong>诚实但单薄</strong>的答案。面试官明显想听的是"你愿意转方向、转的逻辑是什么、你准备怎么补功课"，
+          而我给出的等于"我空白，但我可以学"。
+        </p>
+
+        <h3>下次该怎么答</h3>
+
+        <p>把"为什么愿意转端侧"的逻辑讲清楚，比讲"我学过什么"更值钱：</p>
+
+        <ol>
+          <li>"我做 N 卡的时候有个感受 —— 3080Ti 跑 YOLOv8 是性能过剩的，再压根本压不出来，
+            优化空间其实在 pipeline 调度，不在芯片本身。"</li>
+          <li>"端侧 2–3T 算力的平台反过来：算力是真稀缺，每一毫秒、每一兆带宽都要抠，
+            这种约束下的优化才更接近'真正的部署'。"</li>
+          <li>"所以我反而想往端侧走。技能迁移上，TensorRT 上学到的 ONNX 转换、算子降级、
+            精度回退、kernel 重写、pipeline 并行，这套方法论是平台无关的；
+            真正要补的是各家工具链（RKNN、QNN、SNPE、NeuroPilot）的算子覆盖和量化策略差异。"</li>
+          <li>"已经在看 RK3588 + RKNN 的文档，下一步打算把 YOLOv8n 在 RK3588 上跑通做 baseline。"
+            （此处可以呼应我博客上已有的 yolov8n-rk3588-jetson-nano 那篇 —— 这恰好是个现成证据。）</li>
+        </ol>
+
+        <blockquote>
+          面试官问"你愿不愿意转"，不是真的在问意愿，是在问"你转的逻辑是不是站得住"。
+        </blockquote>
+
+        <h2>表现亮点（要保留的部分）</h2>
+
+        <ul>
+          <li>Polygraphy 用得熟，能讲出"逐层对比 → 定位敏感层 → 混合精度回退"这一整套方法论。</li>
+          <li>讲清了"先优化能控制的（前后处理 / 调度 / 拷贝），最后才动模型"这条工程纪律。</li>
+          <li>对 INT8 的取舍是诚实的 —— 没硬上、没硬吹，说了"得不偿失就没用"。</li>
+          <li>对 TRT plugin 的态度务实，能讲出 EfficientNMS_TRT 这种具体例子来支撑判断。</li>
+          <li>对"精度优先于速度"的红线意识清楚，举出了像素级对比工具 BeyondCompare 的具体用法。</li>
+        </ul>
+
+        <h2>暴露的问题（要改的部分）</h2>
+
+        <ul>
+          <li>讲项目偏流水账，不按"瓶颈 → 动作 → 收益"层级讲。下次必须先拆账。</li>
+          <li>关键数字没准备好：开源项目的 Star 数、commit 数、贡献模型数都没张口报出来。</li>
+          <li>INT8 实战经验薄，没主动桥接到"端侧才是 INT8 真正的舞台"这个 talking point。</li>
+          <li>端侧国产芯片那一题答得太被动，没把"为什么转"讲成一个能立住的故事。</li>
+          <li>主动反问的问题偏 HR 类（团队规模、上班时间），技术 / 业务类的反问几乎没问。</li>
+        </ul>
+
+        <h2>知识点补缺清单</h2>
+
+        <p>按优先级排：</p>
+
+        <h3>P0 — 下一周内补</h3>
+
+        <ul>
+          <li>RK3588 + RKNN：把 YOLOv8n 跑通，记一份 FP32 / FP16 / INT8 在 RK3588 上的延迟和精度对比。</li>
+          <li>INT8 校准策略系统化：entropy / percentile / MSE / minmax 各自的适用场景；校准集大小与分布偏移对精度的影响。</li>
+          <li>QAT 全流程：拿 YOLOv8n 做一次 PyTorch QAT → 导 ONNX → 转 RKNN/TRT 的完整链路。</li>
+        </ul>
+
+        <h3>P1 — 两周内补</h3>
+
+        <ul>
+          <li>高通 SNPE / QNN：算子覆盖、量化工具链、和 MTK NeuroPilot 的差异点。</li>
+          <li>黑芝麻 A1000：算力分布、工具链成熟度、社区资料。</li>
+          <li>视频侧硬件解码：NVDEC / hardware codec / DMA buffer 直通 GPU/NPU，因为公司主营是音视频。</li>
+        </ul>
+
+        <h3>P2 — 长期</h3>
+
+        <ul>
+          <li>模型压缩另外两条路：结构化稀疏（Ampere 2:4）、知识蒸馏在端侧场景的落地。</li>
+          <li>CUDA Graph + multi-stream 并发的边界场景。</li>
+          <li>TensorRT plugin 开发：手写一遍 NMS plugin 把它跑通，理解为什么"工程量大、性能还不一定好"。</li>
+        </ul>
+
+        <h2>对这家公司的判断</h2>
+
+        <ul>
+          <li><strong>方向匹配度</strong>：中等偏上。如果我想转端侧国产芯片，这家公司业务路径很清晰；如果我想继续在 N 卡 GPU 上做服务端推理，这家不匹配。</li>
+          <li><strong>团队规模</strong>：部署 3–4 人偏少，意味着一个人要兼算法集成 + SDK + Docker 打包，成长面广但深度需要自己把控。</li>
+          <li><strong>工作节奏</strong>：9:00 – 18:30，目前没弹性时间。要看双休 / 加班节奏再判断强度。</li>
+          <li><strong>通勤</strong>：公司在深圳，我在公明，需要确认具体地点和通勤时间。</li>
+          <li><strong>风险点</strong>：现有岗位经验和他们主航道（国产端侧）有 gap，入职后第一年大概率要重头补一遍工具链。</li>
+        </ul>
+
+        <h2>行动项</h2>
+
+        <ol>
+          <li>把"换脸 pipeline 1.2s → 0.25s"按 STAR + 收益拆账写成一段 60 秒口播稿，背熟。</li>
+          <li>把开源项目的三个数字（Star / commit / 模型数）写在简历自查清单顶部，每次面试前过一遍。</li>
+          <li>下周内在 RK3588 上跑通 YOLOv8n，写一篇带数据的对比博客（可以衔接已有的 RK3588 + Jetson Nano 那篇）。</li>
+          <li>整理一份"端侧国产芯片切入故事"的 1 分钟答辩稿，把"为什么转 / 我准备怎么补"讲成一个完整逻辑链。</li>
+          <li>下一次面试结束前，<strong>必须问出至少两个技术 / 业务向的反问</strong>，不要只问 HR 类问题。</li>
+        </ol>
+
+        <p>
+          这场面试整体不算差，技术深度被认可了，但<strong>缺的是"把答案讲成结构"和"把方向讲成故事"这两件事</strong>。
+          这两件事都不靠刷题，靠的是面前提前 30 分钟把这些段子练到顺口。下次提前练。
+        </p>
+
+        <footer class="post-footer">
+          <a href="../index.html">Back to all posts</a>
+        </footer>
+      </article>
+    </main>
+  </body>
+</html>

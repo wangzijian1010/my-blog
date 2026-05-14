@@ -6,7 +6,14 @@
     <link>https://wangzijian1010.github.io/my-blog/</link>
     <atom:link href="https://wangzijian1010.github.io/my-blog/feed.xml" rel="self" type="application/rss+xml" />
     <language>zh-CN</language>
-    <lastBuildDate>Tue, 12 May 2026 00:00:00 +0800</lastBuildDate>
+    <lastBuildDate>Thu, 14 May 2026 00:00:00 +0800</lastBuildDate>
+    <item>
+      <title>推理部署岗面试复盘：换脸算法、量化精度与那条没接住的国产芯片问题</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/inference-deployment-interview-review.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/inference-deployment-interview-review.html</guid>
+      <description>一次推理部署岗的面试复盘：FaceFusion 四阶段并行化、FP16/INT8 量化精度排查、与算法组的协作边界，以及那条我没接住的端侧国产芯片问题。</description>
+      <pubDate>Thu, 14 May 2026 00:00:00 +0800</pubDate>
+    </item>
     <item>
       <title>用 Nsight 看穿 TensorRT pipeline 的性能瓶颈</title>
       <link>https://wangzijian1010.github.io/my-blog/posts/nsight-tensorrt-profiling.html</link>
