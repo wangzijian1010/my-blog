@@ -15,6 +15,13 @@
       <pubDate>Thu, 14 May 2026 00:00:00 +0800</pubDate>
     </item>
     <item>
+      <title>在没有反馈的日子里，如何坚持做正确的事</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/no-feedback-right-things.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/no-feedback-right-things.html</guid>
+      <description>大多数人的差距，不是出现在结果那一刻，而是在没有反馈的日子里。确认方向后，学会用过程优化、能力提升和周期性复盘替代即时反馈。</description>
+      <pubDate>Thu, 14 May 2026 00:00:00 +0800</pubDate>
+    </item>
+    <item>
       <title>用 Nsight 看穿 TensorRT pipeline 的性能瓶颈</title>
       <link>https://wangzijian1010.github.io/my-blog/posts/nsight-tensorrt-profiling.html</link>
       <guid>https://wangzijian1010.github.io/my-blog/posts/nsight-tensorrt-profiling.html</guid>
