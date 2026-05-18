@@ -3,14 +3,14 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>CUDA 编程模型入门：SM、Block、Thread、Warp 和内存层级 | 慢慢写</title>
+    <title>CUDA 编程模型入门：执行模型、内存层级和转置优化 | 慢慢写</title>
     <meta
       name="description"
-      content="一篇从零讲清楚 CUDA 执行模型和内存层级的入门文章：SM、Grid、Block、Thread、Warp、Register、Shared Memory、L1/L2 Cache、Global Memory、occupancy 和 coalesced access。"
+      content="一篇从零讲清楚 CUDA 执行模型、内存层级和入门性能优化的学习笔记：SM、Grid、Block、Thread、Warp、Register、Shared Memory、coalesced access、矩阵转置、bank conflict、cudaEvent 和 Nsight Compute。"
     >
     <meta property="og:type" content="article">
-    <meta property="og:title" content="CUDA 编程模型入门：SM、Block、Thread、Warp 和内存层级">
-    <meta property="og:description" content="一篇从零讲清楚 CUDA 执行模型和内存层级的入门文章：SM、Grid、Block、Thread、Warp、Register、Shared Memory、L1/L2 Cache、Global Memory、occupancy 和 coalesced access。">
+    <meta property="og:title" content="CUDA 编程模型入门：执行模型、内存层级和转置优化">
+    <meta property="og:description" content="一篇从零讲清楚 CUDA 执行模型、内存层级和入门性能优化的学习笔记：SM、Grid、Block、Thread、Warp、Register、Shared Memory、coalesced access、矩阵转置、bank conflict、cudaEvent 和 Nsight Compute。">
     <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/cuda-execution-model-sm-block-thread-warp.html">
     <meta name="twitter:card" content="summary">
     <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
@@ -31,7 +31,7 @@
       <article class="post">
         <header class="post-header">
           <p class="eyebrow">cuda 101</p>
-          <h1>CUDA 编程模型入门：SM、Block、Thread、Warp 和内存层级</h1>
+          <h1>CUDA 编程模型入门：执行模型、内存层级和转置优化</h1>
           <p class="post-meta">
             <time datetime="2026-05-18">2026.05.18</time>
             <span>CUDA</span>
@@ -1180,12 +1180,811 @@ SM 执行 warp D</code></pre>
           你的分析就不会散。
         </p>
 
+        <h2>第三个要掌握：向量加法、矩阵转置和 bank conflict</h2>
+
+        <p>
+          如果前面两部分分别是在学 CUDA 的<strong>执行模型</strong>和<strong>内存层级</strong>，
+          那这一部分就是把它们落到第一个真正的性能优化主线里：
+          很多 CUDA kernel 不是算得慢，而是数据搬得慢、搬得不连续，
+          或者搬到 shared memory 后又发生 bank conflict。
+        </p>
+
+        <p>
+          这 3 到 4 个小时真正要掌握的不是“会写向量加法”和“会写矩阵转置”本身，
+          而是下面 4 件事：
+        </p>
+
+        <ol>
+          <li>CUDA kernel 的基本写法。</li>
+          <li>线程如何映射到数据。</li>
+          <li>Global memory 如何高效访问，也就是 coalesced access。</li>
+          <li>Shared memory 如何加速，以及 bank conflict 怎么影响性能。</li>
+        </ol>
+
+        <p>
+          其中 kernel 写法、全局线程编号、coalesced access、shared memory 和 occupancy，
+          前面都已经碰到过。这里会把它们串起来用在转置优化上。
+          <strong>Bank conflict 是前面没有展开的新概念，所以这一节会单独解释。</strong>
+        </p>
+
+        <h3>第一层目标：会写 kernel</h3>
+
+        <p>
+          这部分前面已经碰到过。你要熟悉 CUDA kernel 的最小骨架：
+        </p>
+
+        <pre><code>__global__ void kernel(...) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    ...
+}</code></pre>
+
+        <p>
+          启动时写：
+        </p>
+
+        <pre><code>kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...);</code></pre>
+
+        <p>
+          这只是 CUDA 的基本语法，不是这部分的重点。
+          真正的重点是你能不能解释：同一个数学操作，为什么不同写法性能差很多。
+        </p>
+
+        <h3>第二层目标：会解释性能差异</h3>
+
+        <p>
+          今天最重要的问题其实是这几个：
+        </p>
+
+        <ol>
+          <li>同一个矩阵转置，为什么 naive 版本慢？</li>
+          <li>为什么 shared memory 版本快？</li>
+          <li>为什么 shared memory 版本还不够好？</li>
+          <li>为什么把 <code>tile[32][32]</code> padding 成 <code>tile[32][33]</code> 就能更快？</li>
+        </ol>
+
+        <p>
+          如果这几个问题能讲清楚，就说明你已经开始有 CUDA 优化思维了：
+          先看线程怎么映射到数据，再看 warp 访问 global memory 是否连续，
+          再看 shared memory 里有没有新的冲突。
+        </p>
+
+        <h2>向量加法到底在学什么</h2>
+
+        <p>
+          向量加法代码很简单：
+        </p>
+
+        <pre><code>__global__ void vec_add(float* a, float* b, float* c, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        c[idx] = a[idx] + b[idx];
+    }
+}</code></pre>
+
+        <p>
+          它不是为了考你会不会加法，而是让你掌握 CUDA kernel 的最小骨架。
+          这里的全局索引公式前面已经讲过，再换一种角度复习一遍。
+        </p>
+
+        <h3>为什么这样算全局索引</h3>
+
+        <pre><code>int idx = blockIdx.x * blockDim.x + threadIdx.x;</code></pre>
+
+        <p>
+          因为 <code>threadIdx.x</code> 只是 block 内部编号。
+          比如：
+        </p>
+
+        <pre><code>vec_add&lt;&lt;&lt;4, 256&gt;&gt;&gt;(...);</code></pre>
+
+        <p>
+          表示 4 个 block，每个 block 256 个线程。
+          每个 block 里的 <code>threadIdx.x</code> 都会从 0 开始：
+        </p>
+
+        <pre><code>Block 0: threadIdx.x = 0 ~ 255
+Block 1: threadIdx.x = 0 ~ 255
+Block 2: threadIdx.x = 0 ~ 255
+Block 3: threadIdx.x = 0 ~ 255</code></pre>
+
+        <p>
+          如果只用 <code>int idx = threadIdx.x;</code>，每个 block 都会重复处理 0 到 255。
+          所以必须加上 block 的偏移量：
+        </p>
+
+        <pre><code>blockIdx.x * blockDim.x</code></pre>
+
+        <p>
+          完整映射就是：
+        </p>
+
+        <pre><code>Block 0:
+idx = 0 * 256 + threadIdx.x
+idx = 0 ~ 255
+
+Block 1:
+idx = 1 * 256 + threadIdx.x
+idx = 256 ~ 511
+
+Block 2:
+idx = 2 * 256 + threadIdx.x
+idx = 512 ~ 767
+
+Block 3:
+idx = 3 * 256 + threadIdx.x
+idx = 768 ~ 1023</code></pre>
+
+        <p>
+          所以这个公式的本质，就是把 block 内线程编号转换成整个 grid 里的全局线程编号。
+        </p>
+
+        <h3>为什么需要边界判断</h3>
+
+        <p>
+          这点前面也碰到过：grid size 通常是向上取整。
+        </p>
+
+        <pre><code>int block = 256;
+int grid = (n + block - 1) / block;</code></pre>
+
+        <p>
+          如果 <code>n = 1000</code>，<code>block = 256</code>：
+        </p>
+
+        <pre><code>grid = (1000 + 255) / 256 = 4
+实际启动线程数 = 4 * 256 = 1024</code></pre>
+
+        <p>
+          但是你只有 1000 个元素，最后 24 个线程的 <code>idx</code> 是 1000 到 1023。
+          如果没有：
+        </p>
+
+        <pre><code>if (idx &lt; n)</code></pre>
+
+        <p>
+          这些线程就会访问 <code>a[1000]</code>、<code>a[1001]</code> 这些越界地址。
+        </p>
+
+        <blockquote>
+          因为 kernel launch 的线程数量通常按 block size 向上取整，不一定刚好等于 n，
+          所以需要用 <code>if (idx &lt; n)</code> 防止多出来的线程访问越界。
+        </blockquote>
+
+        <h3>为什么 block 常选 128、256、512</h3>
+
+        <p>
+          这也和前面讲过的 warp 直接相关。Warp size 是 32，
+          一个 block 里的线程会被拆成多个 warp：
+        </p>
+
+        <pre><code>128 threads = 4 warps
+256 threads = 8 warps
+512 threads = 16 warps</code></pre>
+
+        <p>
+          它们都是 32 的整数倍。如果选 1000 threads，虽然没有超过单个 block 常见的 1024 线程上限，
+          但 1000 不是 32 的整数倍：
+        </p>
+
+        <pre><code>1000 / 32 = 31.25</code></pre>
+
+        <p>
+          实际会变成 32 个 warp，最后一个 warp 只有 8 个有效线程，剩下 24 个 lane 浪费。
+          另外，block 太大也不一定好。比如 1024 线程一个 block，
+          可能导致一个 SM 同时驻留的 block 数变少，不利于调度和隐藏延迟。
+        </p>
+
+        <p>
+          所以工程里常见选择是 128、256、512。初学阶段默认写 <code>int block = 256;</code>
+          是一个很稳的选择。
+        </p>
+
+        <h2>矩阵转置到底在学什么</h2>
+
+        <p>
+          矩阵转置是 CUDA 入门优化的重头戏。它不是因为数学难，而是因为它完美暴露了 CUDA 内存访问的问题：
+          读和写很难同时做到连续访问。
+        </p>
+
+        <pre><code>out[x][y] = in[y][x]</code></pre>
+
+        <p>
+          如果输入矩阵是：
+        </p>
+
+        <pre><code>1 2 3
+4 5 6
+7 8 9</code></pre>
+
+        <p>
+          转置后是：
+        </p>
+
+        <pre><code>1 4 7
+2 5 8
+3 6 9</code></pre>
+
+        <p>
+          C/C++ 里的二维数组按 row-major 存储，也就是：
+        </p>
+
+        <pre><code>matrix[y][x]  →  matrix[y * N + x]</code></pre>
+
+        <p>
+          这点必须滚瓜烂熟。后面判断访问是否连续，看的就是同一个 warp 里
+          <code>threadIdx.x = 0 ~ 31</code> 时，一维地址怎么变化。
+        </p>
+
+        <h2>版本 1：Naive transpose</h2>
+
+        <pre><code>__global__ void transpose_naive(float* in, float* out, int N) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x &lt; N && y &lt; N) {
+        out[x * N + y] = in[y * N + x];
+    }
+}</code></pre>
+
+        <p>
+          这里假设矩阵按 row-major 存储，所以 <code>in[y][x]</code> 在一维数组里是
+          <code>in[y * N + x]</code>。
+        </p>
+
+        <h3>Naive 版本读是连续的</h3>
+
+        <p>
+          Coalesced access 前面已经讲过：同一个 warp 内相邻线程访问连续 global memory 地址，
+          硬件就能把多个请求合并成更少的 memory transaction。
+        </p>
+
+        <p>
+          对同一个 warp，如果 <code>threadIdx.x</code> 连续变化，读地址是：
+        </p>
+
+        <pre><code>thread 0  读 in[y * N + x + 0]
+thread 1  读 in[y * N + x + 1]
+thread 2  读 in[y * N + x + 2]
+...
+thread 31 读 in[y * N + x + 31]</code></pre>
+
+        <p>
+          地址连续，所以读是 coalesced 的，很好。
+        </p>
+
+        <h3>Naive 版本写是不连续的</h3>
+
+        <p>
+          写入地址是：
+        </p>
+
+        <pre><code>out[x * N + y]</code></pre>
+
+        <p>
+          对同一个 warp：
+        </p>
+
+        <pre><code>thread 0  写 out[(x + 0) * N + y]
+thread 1  写 out[(x + 1) * N + y]
+thread 2  写 out[(x + 2) * N + y]
+...
+thread 31 写 out[(x + 31) * N + y]</code></pre>
+
+        <p>
+          地址之间相隔 <code>N</code> 个 float。如果 <code>N</code> 很大，地址跳得非常远。
+          这就是 strided access，也就是非连续访问。
+        </p>
+
+        <blockquote>
+          Naive transpose 的问题不是计算复杂，而是 global memory 访问模式差。
+          它读是 coalesced 的，但写是 strided access，导致同一个 warp 的线程写入地址不连续，
+          无法高效合并访问。
+        </blockquote>
+
+        <h2>版本 2：Shared memory transpose</h2>
+
+        <p>
+          Shared memory 前面已经讲过：它是同一个 block 内线程共享的片上内存，
+          比 global memory 快很多，常用于缓存和数据重排。
+          在矩阵转置里，shared memory 的作用不是“存更多数据”，而是做一次中转，
+          让 global memory 的读和写都变成连续访问。
+        </p>
+
+        <pre><code>__global__ void transpose_shared(float* in, float* out, int N) {
+    __shared__ float tile[32][32];
+
+    int x = blockIdx.x * 32 + threadIdx.x;
+    int y = blockIdx.y * 32 + threadIdx.y;
+
+    tile[threadIdx.y][threadIdx.x] = in[y * N + x];
+    __syncthreads();
+
+    x = blockIdx.y * 32 + threadIdx.x;
+    y = blockIdx.x * 32 + threadIdx.y;
+
+    out[y * N + x] = tile[threadIdx.x][threadIdx.y];
+}</code></pre>
+
+        <h3>第一阶段：连续读 global memory</h3>
+
+        <pre><code>tile[threadIdx.y][threadIdx.x] = in[y * N + x];</code></pre>
+
+        <p>
+          对一个 warp 来说，<code>threadIdx.x</code> 连续变化，
+          所以读取的是：
+        </p>
+
+        <pre><code>in[y * N + x]
+in[y * N + x + 1]
+in[y * N + x + 2]
+...</code></pre>
+
+        <p>
+          这是连续读，global memory 读取是 coalesced 的。
+        </p>
+
+        <h3>第二阶段：放到 shared memory 里</h3>
+
+        <p>
+          读进来的数据先放到 <code>tile[threadIdx.y][threadIdx.x]</code>，
+          也就是一个 <code>32 x 32</code> 的小块。可以理解成：
+        </p>
+
+        <pre><code>从 global memory 搬一块 32x32 到 shared memory</code></pre>
+
+        <p>
+          这里的 <code>__syncthreads();</code> 前面已经碰到过。
+          它表示 block 内所有线程在这里集合，等大家都完成 shared memory 写入后，
+          再继续往下执行。否则有些线程可能会读取到还没写好的 shared memory 数据。
+        </p>
+
+        <h3>第三阶段：连续写 global memory</h3>
+
+        <pre><code>x = blockIdx.y * 32 + threadIdx.x;
+y = blockIdx.x * 32 + threadIdx.y;
+
+out[y * N + x] = tile[threadIdx.x][threadIdx.y];</code></pre>
+
+        <p>
+          这一步把 block 坐标交换了。原来处理的是输入矩阵中的一块，
+          转置后要写到输出矩阵中对称的位置，所以 <code>blockIdx.x</code> 和
+          <code>blockIdx.y</code> 的角色发生了交换。
+        </p>
+
+        <p>
+          关键是写的时候，<code>threadIdx.x</code> 仍然让 <code>x</code> 连续变化。
+          因此 <code>out[y * N + x]</code> 的写入地址也是连续的。
+        </p>
+
+        <blockquote>
+          Shared memory 版本把 naive 的“读连续、写不连续”，变成了“读 global memory 连续、
+          写 global memory 也连续”。中间靠 shared memory 做了一次转置缓冲。
+        </blockquote>
+
+        <p>
+          但这个版本还有一个问题：虽然 global memory 访问变好了，
+          shared memory 自己可能出问题。问题就出在：
+        </p>
+
+        <pre><code>tile[threadIdx.x][threadIdx.y]</code></pre>
+
+        <p>
+          这相当于按列读取 shared memory，可能导致 bank conflict。
+          Bank conflict 是前面没有展开的新概念，下面单独讲。
+        </p>
+
+        <h2>Shared Memory Bank 是什么</h2>
+
+        <p>
+          Shared memory 不是一个完整的大桶，它被分成多个 bank。
+          常见情况下可以先按这个模型理解：
+        </p>
+
+        <pre><code>32 个 bank
+每个 bank 宽度 4 字节
+float 正好 4 字节</code></pre>
+
+        <p>
+          所以对 float 数组来说，连续的 float 通常会依次落到 bank 0、bank 1、bank 2，
+          一直到 bank 31：
+        </p>
+
+        <pre><code>tile[0][0]  → bank 0
+tile[0][1]  → bank 1
+tile[0][2]  → bank 2
+...
+tile[0][31] → bank 31</code></pre>
+
+        <p>
+          如果同一个 warp 的 32 个线程访问 32 个不同 bank，速度很好。
+          如果多个线程访问同一个 bank 的不同地址，就会发生 bank conflict，
+          这些访问会被拆开处理，shared memory 访问就会变慢。
+        </p>
+
+        <blockquote>
+          Bank conflict 的核心：同一个 warp 里多个线程同时访问同一个 shared memory bank 的不同地址，
+          硬件无法一次并行完成，只能分批处理。
+        </blockquote>
+
+        <h2>为什么 tile[32][32] 会有 bank conflict</h2>
+
+        <p>
+          二维数组在内存里是 row-major 存储：
+        </p>
+
+        <pre><code>float tile[32][32];</code></pre>
+
+        <p>
+          内存布局是：
+        </p>
+
+        <pre><code>tile[0][0], tile[0][1], ..., tile[0][31],
+tile[1][0], tile[1][1], ..., tile[1][31],
+tile[2][0], ...</code></pre>
+
+        <p>
+          地址下标可以理解成：
+        </p>
+
+        <pre><code>address_index = row * 32 + col
+bank = address_index % 32</code></pre>
+
+        <h3>按行访问没有冲突</h3>
+
+        <p>
+          访问 <code>tile[threadIdx.y][threadIdx.x]</code> 时，
+          假设 <code>threadIdx.y</code> 固定，<code>threadIdx.x = 0 ~ 31</code>：
+        </p>
+
+        <pre><code>tile[row][0]  → index = row * 32 + 0  → bank 0
+tile[row][1]  → index = row * 32 + 1  → bank 1
+tile[row][2]  → index = row * 32 + 2  → bank 2
+...
+tile[row][31] → index = row * 32 + 31 → bank 31</code></pre>
+
+        <p>
+          32 个线程访问 32 个不同 bank，没有冲突。
+        </p>
+
+        <h3>按列访问会冲突</h3>
+
+        <p>
+          访问 <code>tile[threadIdx.x][threadIdx.y]</code> 时，
+          假设 <code>threadIdx.y</code> 固定，也就是列 <code>col</code> 固定，
+          <code>threadIdx.x = 0 ~ 31</code>：
+        </p>
+
+        <pre><code>tile[0][col]  → index = 0  * 32 + col
+tile[1][col]  → index = 1  * 32 + col
+tile[2][col]  → index = 2  * 32 + col
+...
+tile[31][col] → index = 31 * 32 + col</code></pre>
+
+        <p>
+          bank 计算是：
+        </p>
+
+        <pre><code>bank = (row * 32 + col) % 32</code></pre>
+
+        <p>
+          因为 <code>row * 32 % 32 = 0</code>，所以：
+        </p>
+
+        <pre><code>bank = col</code></pre>
+
+        <p>
+          也就是说：
+        </p>
+
+        <pre><code>tile[0][col]  → bank col
+tile[1][col]  → bank col
+tile[2][col]  → bank col
+...
+tile[31][col] → bank col</code></pre>
+
+        <p>
+          32 个线程全部访问同一个 bank，这就是 32-way bank conflict。
+        </p>
+
+        <h2>为什么 tile[32][33] 能解决 bank conflict</h2>
+
+        <p>
+          padding 版本只改一行：
+        </p>
+
+        <pre><code>__shared__ float tile[32][33];</code></pre>
+
+        <p>
+          第二维从 32 变成 33，地址计算就变成：
+        </p>
+
+        <pre><code>address_index = row * 33 + col
+bank = address_index % 32</code></pre>
+
+        <p>
+          如果按列访问：
+        </p>
+
+        <pre><code>tile[0][col]  → index = 0  * 33 + col → bank = col
+tile[1][col]  → index = 1  * 33 + col → bank = col + 1
+tile[2][col]  → index = 2  * 33 + col → bank = col + 2
+...
+tile[31][col] → index = 31 * 33 + col → bank = col + 31</code></pre>
+
+        <p>
+          因为：
+        </p>
+
+        <pre><code>33 % 32 = 1</code></pre>
+
+        <p>
+          所以每往下一行，bank 就错开 1 个。
+          于是原来全部落到同一个 bank 的列访问，被分散到了 32 个不同 bank。
+        </p>
+
+        <blockquote>
+          Padding 的本质不是让 shared memory 变大一点，而是改变二维数组每一行的步长，
+          让按列访问时的 bank 映射错开，从而消除 32-way bank conflict。
+        </blockquote>
+
+        <h2>三个转置版本应该怎么学</h2>
+
+        <p>
+          不要一上来追性能数字。更稳的顺序是先画图，再写代码，再测性能。
+        </p>
+
+        <h3>第一步：先画小矩阵</h3>
+
+        <p>
+          先画一个小矩阵，不要直接画 32 x 32：
+        </p>
+
+        <pre><code>原矩阵 in:
+a00 a01 a02 a03
+a10 a11 a12 a13
+a20 a21 a22 a23
+a30 a31 a32 a33
+
+转置后 out:
+a00 a10 a20 a30
+a01 a11 a21 a31
+a02 a12 a22 a32
+a03 a13 a23 a33</code></pre>
+
+        <p>
+          先理解：
+        </p>
+
+        <pre><code>in[y][x] → out[x][y]
+out[x * N + y] = in[y * N + x]</code></pre>
+
+        <h3>第二步：手敲 naive</h3>
+
+        <p>
+          写完 naive 后，只问自己两个问题：读是不是连续？写是不是连续？
+          判断方法就是看同一个 warp 里 <code>threadIdx.x = 0 ~ 31</code> 时，
+          它们访问的一维地址是不是连续。
+        </p>
+
+        <h3>第三步：手敲 shared 版本</h3>
+
+        <p>
+          重点理解两个动作：
+        </p>
+
+        <pre><code>global memory → shared memory
+shared memory → global memory</code></pre>
+
+        <p>
+          也就是：
+        </p>
+
+        <pre><code>tile[ty][tx] = in[y * N + x];
+out[y * N + x] = tile[tx][ty];</code></pre>
+
+        <p>
+          Shared memory 在这里是中转站，用来改变访问顺序，让 global memory 的读写都尽量连续。
+        </p>
+
+        <h3>第四步：手敲 padded 版本</h3>
+
+        <p>
+          只改一行：
+        </p>
+
+        <pre><code>__shared__ float tile[32][33];</code></pre>
+
+        <p>
+          然后用纸算 <code>tile[0][col]</code>、<code>tile[1][col]</code>、
+          <code>tile[2][col]</code> 到 <code>tile[31][col]</code> 分别落在哪个 bank。
+          这一段必须手算一遍，bank conflict 才会真的懂。
+        </p>
+
+        <h2>计时和有效带宽</h2>
+
+        <p>
+          计时是这部分的新实践点。不要用 <code>std::chrono</code> 直接包 kernel，
+          因为 kernel launch 是异步的。CPU 发起 kernel 后可能马上返回，
+          但 GPU 还没有真正执行完。
+        </p>
+
+        <p>
+          更合适的是用 CUDA event：
+        </p>
+
+        <pre><code>cudaEvent_t start, stop;
+cudaEventCreate(&start);
+cudaEventCreate(&stop);
+
+cudaEventRecord(start);
+transpose_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_out, N);
+cudaEventRecord(stop);
+
+cudaEventSynchronize(stop);
+
+float ms = 0;
+cudaEventElapsedTime(&ms, start, stop);</code></pre>
+
+        <p>
+          <code>cudaEventSynchronize(stop);</code> 很关键。
+          它确保 stop event 之前的 GPU 工作已经完成，否则你测到的时间不可靠。
+        </p>
+
+        <p>
+          矩阵转置不是算力密集型，而是内存带宽密集型。
+          一次转置至少要读 <code>N * N</code> 个 float，再写 <code>N * N</code> 个 float。
+          所以总数据量是：
+        </p>
+
+        <pre><code>N * N * sizeof(float) * 2</code></pre>
+
+        <p>
+          有效带宽可以这样算：
+        </p>
+
+        <pre><code>double bytes = 2.0 * N * N * sizeof(float);
+double gbps = bytes / (ms / 1000.0) / 1e9;</code></pre>
+
+        <p>
+          你不需要一开始就追求某个固定 GB/s 数字。
+          先看趋势：naive 慢，shared 快，padded 更合理。
+          如果结果不是这样，反而是学习机会。常见原因包括矩阵太小、计时包含了
+          <code>cudaMemcpy</code>、没有 warmup、没有重复运行取平均、block/grid 配置不对、
+          编译没开优化、边界判断有问题。
+        </p>
+
+        <h2>Nsight Compute 这一步在学什么</h2>
+
+        <p>
+          Nsight Compute 不要求你马上变成 profiling 专家。
+          这一步的目标只是建立一个感觉：代码慢，工具能告诉你慢在哪里。
+          先认识几个指标就够。
+        </p>
+
+        <h3>Memory Throughput</h3>
+
+        <p>
+          看 global memory 带宽用了多少。如果 naive 很低，shared/padded 明显更高，
+          通常说明 coalescing 和访问重排确实起作用了。
+        </p>
+
+        <h3>Shared Memory Bank Conflicts</h3>
+
+        <p>
+          看 shared memory 是否发生 bank conflict。
+          理论上 <code>tile[32][32]</code> 版本应该有明显 bank conflict，
+          <code>tile[32][33]</code> 版本应该明显减少，甚至接近 0。
+        </p>
+
+        <h3>Achieved Occupancy</h3>
+
+        <p>
+          Occupancy 前面已经讲过。这里看的是实际活跃 warp 的比例。
+          它不是越高一定越好，但太低通常需要注意：可能是 block size、register 用量、
+          shared memory 用量限制了 SM 上能驻留的 warp 数。
+        </p>
+
+        <h3>Memory Coalescing</h3>
+
+        <p>
+          看 global memory 访问是否合并良好。Naive transpose 的写入通常比较差；
+          shared/padded 版本的 global memory 读写应该更好。
+        </p>
+
+        <h2>这部分不要过度纠结什么</h2>
+
+        <p>
+          今天不要陷入这些细节：
+        </p>
+
+        <ol>
+          <li>L1/shared 的具体配置比例。</li>
+          <li>每代 GPU 的 bank 宽度历史差异。</li>
+          <li>Nsight Compute 里每一个指标的数学定义。</li>
+          <li>理论带宽和实测带宽为什么差很多。</li>
+          <li>Occupancy calculator 的所有细节。</li>
+        </ol>
+
+        <p>
+          今天只要达成这几个目标就够：知道 naive 为什么慢，知道 shared 为什么快，
+          知道 padding 为什么解决 bank conflict，能用 cudaEvent 测时间，
+          能用 Nsight Compute 找到几个关键指标。
+        </p>
+
+        <h2>这部分的 5 个自检题</h2>
+
+        <h3>3080 Ti 上一个 SM 最多能驻留多少 warp 和 block</h3>
+
+        <blockquote>
+          Ampere / RTX 3080 Ti 上，每个 SM 最多 48 个 resident warps、1536 个 resident threads、
+          16 个 resident blocks。但这是硬件理论上限，实际 occupancy 还会受 block size、
+          每个线程使用的 register 数、每个 block 使用的 shared memory 限制。
+        </blockquote>
+
+        <h3>为什么 warp size 是 32</h3>
+
+        <blockquote>
+          Warp size 是 NVIDIA CUDA 硬件定义的执行粒度，一个 warp 固定 32 个线程。
+          它是硬件在吞吐、调度复杂度、内存合并访问粒度和控制逻辑之间做的架构选择。
+          对 CUDA 程序员来说，重点不是追问为什么一定是 32，而是理解硬件以 32 个线程为一组执行，
+          所以 block size 通常选择 32 的整数倍，并尽量避免同一个 warp 内的分支发散和非连续内存访问。
+        </blockquote>
+
+        <h3>Shared memory 和 L1 cache 是什么关系</h3>
+
+        <blockquote>
+          Shared memory 和 L1 cache 都是 SM 附近的片上存储资源。L1 cache 由硬件自动管理，
+          主要缓存 global memory 访问；shared memory 由程序员显式声明和管理，
+          用于 block 内线程共享数据。很多 NVIDIA 架构中，L1 cache 和 shared memory 会共享同一部分片上存储资源，
+          只是使用方式不同。
+        </blockquote>
+
+        <h3>什么叫 coalesced access，非 coalesced 会损失多少性能</h3>
+
+        <blockquote>
+          Coalesced access 指同一个 warp 内相邻线程访问连续的 global memory 地址。
+          这样硬件可以把多个线程的内存访问合并成更少的 memory transaction，提高带宽利用率。
+          非 coalesced access 会产生更多内存事务，导致实际带宽大幅下降。
+          具体损失多少取决于访问跨度、数据类型、缓存命中和架构，
+          但像矩阵转置这种典型 strided write，性能可能差好几倍甚至一个数量级。
+        </blockquote>
+
+        <h3>Bank conflict 是怎么产生的，为什么 padding 能解决</h3>
+
+        <blockquote>
+          Shared memory 被划分成 32 个 bank。对于 float 类型，连续元素通常落到连续 bank。
+          如果同一个 warp 中多个线程访问同一个 bank 的不同地址，就会发生 bank conflict，访问会被串行化。
+          <code>tile[32][32]</code> 按列访问时，相邻行地址间隔是 32 个 float，
+          对 32 个 bank 取模后都落在同一个 bank，造成 32-way conflict。
+          把第二维改成 33 后，相邻行地址间隔变成 33，33 对 32 取模等于 1，
+          所以每一行错开一个 bank，列访问时分散到不同 bank，从而消除冲突。
+        </blockquote>
+
+        <h2>这部分最应该带走的东西</h2>
+
+        <p>
+          不要把今天理解成“我学了 <code>vec_add</code> 和 <code>transpose</code>”。
+          更准确的理解应该是：你学了 CUDA 性能优化的第一套基本功：
+          线程如何映射到数据；warp 如何访问 global memory；shared memory 如何做数据重排；
+          bank conflict 为什么会拖慢 shared memory；如何用 cudaEvent 和 Nsight Compute 验证性能问题。
+        </p>
+
+        <blockquote>
+          向量加法让我熟悉 CUDA kernel 的基本写法和线程索引；矩阵转置让我理解 CUDA 优化的核心不是数学操作本身，
+          而是内存访问模式。Naive transpose 的问题是写 global memory 不连续，
+          shared memory 版本通过 tile 做中转，让读写都变成 coalesced；
+          但 <code>tile[32][32]</code> 按列访问会导致 shared memory bank conflict，
+          所以通过 <code>tile[32][33]</code> padding 让相邻行错开 bank，从而消除冲突。
+          最后用 cudaEvent 和 Nsight Compute 验证性能差异。
+        </blockquote>
+
         <h2>把执行模型和内存层级合起来</h2>
 
         <p>
-          前半篇讲的是：thread 组成 block，block 被调度到 SM，SM 把线程拆成 warp 执行。
-          后半篇讲的是：这些 warp 在执行指令时，数据会从 register、shared memory/L1、L2、global memory
-          这些层级里来回流动。
+          第一部分讲的是：thread 组成 block，block 被调度到 SM，SM 把线程拆成 warp 执行。
+          第二部分讲的是：这些 warp 在执行指令时，数据会从 register、shared memory/L1、L2、global memory
+          这些层级里来回流动。第三部分讲的是：真正写 kernel 时，性能差异经常来自 global memory 是否连续访问、
+          shared memory 是否真的带来数据复用，以及 shared memory 内部有没有 bank conflict。
         </p>
 
         <blockquote>
