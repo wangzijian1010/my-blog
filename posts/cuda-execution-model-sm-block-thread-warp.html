@@ -1,0 +1,742 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CUDA 编程模型入门：SM、Block、Thread 和 Warp 到底怎么配合 | 慢慢写</title>
+    <meta
+      name="description"
+      content="一篇从零讲清楚 CUDA 执行模型的入门文章：GPU、SM、Grid、Block、Thread、Warp、全局线程编号、occupancy、分支发散和内存合并访问。"
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="CUDA 编程模型入门：SM、Block、Thread 和 Warp 到底怎么配合">
+    <meta property="og:description" content="一篇从零讲清楚 CUDA 执行模型的入门文章：GPU、SM、Grid、Block、Thread、Warp、全局线程编号、occupancy、分支发散和内存合并访问。">
+    <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/cuda-execution-model-sm-block-thread-warp.html">
+    <meta name="twitter:card" content="summary">
+    <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../index.html">慢慢写</a>
+      <nav aria-label="Primary navigation">
+        <a href="../index.html">Home</a>
+        <a href="../archive.html">Posts</a>
+        <a href="../index.html#about">About</a>
+        <a href="../feed.xml">RSS</a>
+      </nav>
+    </header>
+
+    <main class="article-shell">
+      <article class="post">
+        <header class="post-header">
+          <p class="eyebrow">cuda 101</p>
+          <h1>CUDA 编程模型入门：SM、Block、Thread 和 Warp 到底怎么配合</h1>
+          <p class="post-meta">
+            <time datetime="2026-05-18">2026.05.18</time>
+            <span>CUDA</span>
+            <span>GPU</span>
+            <span>SM</span>
+            <span>Warp</span>
+            <span>性能优化</span>
+          </p>
+        </header>
+
+        <p class="lead">
+          CUDA 编程模型的核心，就是把大量线程分组，然后让 GPU 的多个 SM 去并行执行这些线程组。
+          如果先不用术语，可以把它理解成一座工厂：GPU 是整座工厂，SM 是工厂里的车间，
+          Block 是分配给车间的一批任务，Thread 是真正干活的工人，Warp 是 32 个工人组成的固定小队。
+        </p>
+
+        <pre><code>一张 GPU = 一个工厂
+SM       = 工厂里的车间
+Block    = 分配给车间的一批任务
+Thread   = 干活的工人
+Warp     = 32 个工人组成的固定小队</code></pre>
+
+        <p>
+          你现在先记住这句话：<strong>CUDA 不是把一个大任务丢给一个“大核心”，而是把任务拆成很多 block，
+          再把这些 block 调度到很多 SM 上执行；每个 SM 内部又把线程按 warp 来执行。</strong>
+          后面所有概念都围绕这句话展开。
+        </p>
+
+        <h2>SM 是什么</h2>
+
+        <p>
+          SM 全称是 Streaming Multiprocessor，可以理解为 GPU 里真正干活的计算单元。
+          CPU 通常说 8 核、16 核；GPU 的结构不是一个超大的核心，而是由几十个甚至上百个 SM 组成。
+          每个 SM 里面有 CUDA Core、寄存器、共享内存、调度器等硬件资源。
+        </p>
+
+        <p>
+          所以你写 CUDA kernel 的时候，本质上是让很多线程被组织成 block，
+          再让 GPU 把这些 block 分配到不同 SM 上执行。你不直接调度 CUDA Core，
+          你真正需要重点理解的是 <strong>SM</strong>，因为 <strong>block 是被分配到 SM 上的</strong>。
+        </p>
+
+        <h3>3080 Ti 有多少个 SM</h3>
+
+        <p>
+          RTX 3080 Ti 使用 GA102 芯片，一共有 <strong>80 个 SM</strong>。
+          每个 SM 里有 128 个 FP32 CUDA Core，所以总 FP32 CUDA Core 数量是：
+        </p>
+
+        <pre><code>80 × 128 = 10240 个 CUDA Core</code></pre>
+
+        <p>
+          但这里要注意：CUDA Core 不是你写代码时直接调度的单位。
+          你启动 kernel 时配置的是 grid 和 block，硬件调度时以 block 为单位分配到 SM。
+          理解了 SM，才算真正开始理解 CUDA 的执行模型。
+        </p>
+
+        <h2>Grid、Block、Thread 是什么关系</h2>
+
+        <p>
+          CUDA 里启动一个 kernel，一般长这样：
+        </p>
+
+        <pre><code>kernel&lt;&lt;&lt;gridDim, blockDim&gt;&gt;&gt;(...);</code></pre>
+
+        <p>
+          比如：
+        </p>
+
+        <pre><code>myKernel&lt;&lt;&lt;4, 256&gt;&gt;&gt;(...);</code></pre>
+
+        <p>
+          这句话的意思是：启动 4 个 block，每个 block 有 256 个 thread，
+          所以总线程数是：
+        </p>
+
+        <pre><code>4 × 256 = 1024 个 thread</code></pre>
+
+        <p>
+          结构可以画成这样：
+        </p>
+
+        <pre><code>Grid
+ ├── Block 0
+ │    ├── Thread 0
+ │    ├── Thread 1
+ │    ├── ...
+ │    └── Thread 255
+ │
+ ├── Block 1
+ │    ├── Thread 0
+ │    ├── Thread 1
+ │    ├── ...
+ │
+ ├── Block 2
+ │
+ └── Block 3</code></pre>
+
+        <p>
+          所以 CUDA 的三级结构是：
+        </p>
+
+        <pre><code>Grid  →  Block  →  Thread
+整个任务 → 任务小组 → 具体线程</code></pre>
+
+        <p>
+          一个重要细节是：<strong>一个 block 会被放到一个 SM 上执行，不会被拆到多个 SM 上。</strong>
+          这也是为什么同一个 block 内的线程可以使用 shared memory，也可以用
+          <code>__syncthreads()</code> 做同步；不同 block 之间不能直接同步，也不能直接共享 block 内的 shared memory。
+        </p>
+
+        <h2>CUDA 内置变量：blockIdx、threadIdx、blockDim、gridDim</h2>
+
+        <p>
+          这些变量是 CUDA 自动给你的。你不用自己定义，kernel 里可以直接用。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>变量</th>
+                <th>含义</th>
+                <th><code>myKernel&lt;&lt;&lt;4, 256&gt;&gt;&gt;</code> 里的值</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>threadIdx.x</code></td>
+                <td>当前线程在自己 block 里的编号</td>
+                <td><code>0 ~ 255</code></td>
+              </tr>
+              <tr>
+                <td><code>blockIdx.x</code></td>
+                <td>当前 block 在整个 grid 里的编号</td>
+                <td><code>0 ~ 3</code></td>
+              </tr>
+              <tr>
+                <td><code>blockDim.x</code></td>
+                <td>每个 block 有多少个线程</td>
+                <td><code>256</code></td>
+              </tr>
+              <tr>
+                <td><code>gridDim.x</code></td>
+                <td>整个 grid 有多少个 block</td>
+                <td><code>4</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          <code>threadIdx</code> 只是在当前 block 内部编号，不是全局编号。
+          所以 Block 0 里有 <code>threadIdx.x = 0</code>，
+          Block 1 里也有 <code>threadIdx.x = 0</code>，
+          Block 2 里也有 <code>threadIdx.x = 0</code>。
+          每个 block 内部都会从 0 重新编号。
+        </p>
+
+        <h2>怎么算一个线程的全局编号</h2>
+
+        <p>
+          这是 CUDA 最核心的公式之一：
+        </p>
+
+        <pre><code>int idx = blockIdx.x * blockDim.x + threadIdx.x;</code></pre>
+
+        <p>
+          还是看这个启动配置：
+        </p>
+
+        <pre><code>myKernel&lt;&lt;&lt;4, 256&gt;&gt;&gt;(...);</code></pre>
+
+        <p>
+          每个 block 里有 256 个线程，所以全局线程编号是：
+        </p>
+
+        <pre><code>Block 0:
+idx = 0 * 256 + threadIdx.x
+idx = 0 ~ 255
+
+Block 1:
+idx = 1 * 256 + threadIdx.x
+idx = 256 ~ 511
+
+Block 2:
+idx = 2 * 256 + threadIdx.x
+idx = 512 ~ 767
+
+Block 3:
+idx = 3 * 256 + threadIdx.x
+idx = 768 ~ 1023</code></pre>
+
+        <p>
+          所以这行代码的作用，就是把 block 内部编号转换成整个 grid 里的全局线程编号。
+          以后你写 CUDA kernel，十有八九都会看到它。
+        </p>
+
+        <h2>Block 是怎么分配到 SM 上的</h2>
+
+        <p>
+          当你启动：
+        </p>
+
+        <pre><code>myKernel&lt;&lt;&lt;100, 256&gt;&gt;&gt;(...);</code></pre>
+
+        <p>
+          表示你创建了 100 个 block，每个 block 256 个 thread。
+          这些 block 会被 GPU 的硬件调度器分配到 SM 上执行。
+        </p>
+
+        <p>
+          如果你的 GPU 是 RTX 3080 Ti，有 80 个 SM，那么大概可以想成：
+        </p>
+
+        <pre><code>SM0  分到一些 block
+SM1  分到一些 block
+SM2  分到一些 block
+...
+SM79 分到一些 block</code></pre>
+
+        <p>
+          但你不能手动指定某个 block 去某个 SM。CUDA 的调度规则可以粗略理解为：
+          <strong>哪个 SM 有空，哪个 SM 就拿下一个 block 执行</strong>。
+        </p>
+
+        <pre><code>80 个窗口办理业务
+100 个客户排队
+哪个窗口空了，下一个客户就过去
+
+窗口 = SM
+客户 = Block</code></pre>
+
+        <p>
+          如果 block 数很多，SM 执行完当前驻留的一批 block 之后，会继续拿下一批 block。
+          这就是 GPU 能同时处理大量任务的基础。
+        </p>
+
+        <h2>一个 SM 能同时跑多少个 block</h2>
+
+        <p>
+          这个问题不能只看 GPU 型号，还要看你的 kernel 用了多少资源。
+          一个 SM 上可以同时驻留多个 block，这叫 resident blocks，也可以理解成同一个 SM 上同时挂着多个 block。
+        </p>
+
+        <p>
+          但一个 SM 能同时放几个 block，受这些因素限制：
+        </p>
+
+        <ol>
+          <li>每个 block 有多少线程。</li>
+          <li>每个线程用了多少寄存器。</li>
+          <li>每个 block 用了多少 shared memory。</li>
+          <li>GPU 架构本身的硬件上限。</li>
+        </ol>
+
+        <p>
+          以 3080 Ti / Ampere 架构为例，一个 SM 的常见上限是：
+        </p>
+
+        <pre><code>最多 1536 个 resident threads
+最多 48 个 resident warps
+最多 16 个 resident blocks</code></pre>
+
+        <p>
+          这些只是理论上限。你的 kernel 如果用了很多 shared memory 或寄存器，实际能驻留的 block 数会更少。
+        </p>
+
+        <h3>例子 1：每个 block 256 个线程</h3>
+
+        <pre><code>myKernel&lt;&lt;&lt;..., 256&gt;&gt;&gt;(...);</code></pre>
+
+        <p>
+          一个 block 有 256 个线程，也就是 8 个 warp。
+          如果只看线程数，一个 SM 最多 1536 个线程：
+        </p>
+
+        <pre><code>1536 / 256 = 6 个 block</code></pre>
+
+        <p>
+          所以理想情况下，一个 SM 可以同时放 6 个 256-thread block。
+        </p>
+
+        <h3>例子 2：每个 block 1024 个线程</h3>
+
+        <pre><code>myKernel&lt;&lt;&lt;..., 1024&gt;&gt;&gt;(...);</code></pre>
+
+        <p>
+          一个 block 有 1024 个线程，也就是 32 个 warp。
+          只看线程数：
+        </p>
+
+        <pre><code>1536 / 1024 = 1 个 block</code></pre>
+
+        <p>
+          虽然还剩 512 个线程容量，但不够再放一个 1024-thread block。
+          所以一个 SM 同时只能放 1 个这种 block。这也是为什么 block size 不是越大越好。
+        </p>
+
+        <h3>例子 3：每个 block 128 个线程</h3>
+
+        <pre><code>myKernel&lt;&lt;&lt;..., 128&gt;&gt;&gt;(...);</code></pre>
+
+        <p>
+          一个 block 有 128 个线程，也就是 4 个 warp。只看线程数：
+        </p>
+
+        <pre><code>1536 / 128 = 12 个 block</code></pre>
+
+        <p>
+          所以一个 SM 理论上可以同时放 12 个 128-thread block。
+          但如果 kernel 使用了很多寄存器或 shared memory，实际数量可能低于 12。
+        </p>
+
+        <h2>Warp 是什么</h2>
+
+        <p>
+          Warp 是 CUDA 真正执行线程的基本单位。一个 warp 固定是 <strong>32 个线程</strong>。
+          你写代码的时候，感觉每个 thread 是独立执行的；但硬件执行的时候，
+          不是一个 thread 一个 thread 执行，而是 32 个 thread 组成一个 warp，
+          一起执行同一条指令。
+        </p>
+
+        <p>
+          这种执行模型叫 SIMT，Single Instruction, Multiple Threads。
+          可以理解成：<strong>一条指令，多个线程一起干</strong>。
+        </p>
+
+        <p>
+          比如这个最常见的向量加法 kernel：
+        </p>
+
+        <pre><code>__global__ void add(float* a, float* b, float* c) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    c[idx] = a[idx] + b[idx];
+}</code></pre>
+
+        <p>
+          假设一个 warp 里的 32 个线程编号是 thread 0 到 thread 31。
+          它们会一起执行：
+        </p>
+
+        <pre><code>c[idx] = a[idx] + b[idx];</code></pre>
+
+        <p>
+          只是每个线程的 <code>idx</code> 不同：
+        </p>
+
+        <pre><code>thread 0  处理 c[0]  = a[0]  + b[0]
+thread 1  处理 c[1]  = a[1]  + b[1]
+thread 2  处理 c[2]  = a[2]  + b[2]
+...
+thread 31 处理 c[31] = a[31] + b[31]</code></pre>
+
+        <p>
+          所以看起来是 32 个线程各干各的，实际上是硬件把它们作为一组来执行。
+        </p>
+
+        <h2>为什么 Warp 是理解性能问题的起点</h2>
+
+        <p>
+          GPU 性能问题很多都和 warp 有关。最重要的三个概念是：
+        </p>
+
+        <ol>
+          <li>Warp divergence：分支发散。</li>
+          <li>Memory coalescing：内存合并访问。</li>
+          <li>Occupancy：SM 上有多少 warp 能同时驻留。</li>
+        </ol>
+
+        <h3>分支发散：warp divergence</h3>
+
+        <p>
+          看这个代码：
+        </p>
+
+        <pre><code>if (threadIdx.x % 2 == 0) {
+    // 偶数线程做 A
+} else {
+    // 奇数线程做 B
+}</code></pre>
+
+        <p>
+          一个 warp 里有 32 个线程，其中 16 个线程走 <code>if</code>，16 个线程走 <code>else</code>。
+          问题是：一个 warp 里的线程应该一起执行同一条指令。
+          但现在一半要执行 A，一半要执行 B。
+        </p>
+
+        <p>
+          GPU 只能先让偶数线程执行 A，奇数线程暂时屏蔽；
+          再让奇数线程执行 B，偶数线程暂时屏蔽。
+          原来一次能干完的事情，现在变成两次，这就叫 warp divergence。
+        </p>
+
+        <blockquote>
+          同一个 warp 里的线程走了不同分支，执行会被拆开，性能就会下降。
+        </blockquote>
+
+        <h3>内存合并访问：memory coalescing</h3>
+
+        <p>
+          GPU 访问 global memory 的时候，很喜欢相邻线程访问相邻内存。
+          比如：
+        </p>
+
+        <pre><code>c[idx] = a[idx] + b[idx];</code></pre>
+
+        <p>
+          一个 warp 里的线程访问：
+        </p>
+
+        <pre><code>a[0], a[1], a[2], ..., a[31]</code></pre>
+
+        <p>
+          这些地址是连续的。硬件可以把这些访问合并成更少的内存事务，
+          这叫 coalesced memory access，也就是内存合并访问，性能很好。
+        </p>
+
+        <p>
+          但如果你这样访问：
+        </p>
+
+        <pre><code>c[idx] = a[idx * 32] + b[idx * 32];</code></pre>
+
+        <p>
+          一个 warp 里的线程访问：
+        </p>
+
+        <pre><code>a[0], a[32], a[64], a[96], ...</code></pre>
+
+        <p>
+          地址跳得很远，GPU 就很难合并访问，global memory 访问效率会下降。
+          所以你以后优化 CUDA kernel，经常会听到一句话：
+        </p>
+
+        <blockquote>
+          让相邻线程访问相邻内存。
+        </blockquote>
+
+        <p>
+          这句话的根源就是 warp。
+        </p>
+
+        <h3>Occupancy：占用率</h3>
+
+        <p>
+          Occupancy 可以粗略理解为：一个 SM 上同时挂了多少个 warp。
+          如果一个 SM 上只有很少的 warp，当某个 warp 等 global memory 的时候，SM 可能就没活干了。
+        </p>
+
+        <p>
+          如果一个 SM 上有很多 warp，那么：
+        </p>
+
+        <pre><code>warp A 等内存
+SM 切去执行 warp B
+
+warp B 等内存
+SM 切去执行 warp C
+
+warp C 等内存
+SM 再切去执行别的 warp</code></pre>
+
+        <p>
+          这样可以把等待时间隐藏掉。GPU 不是靠“单个线程很快”取胜，
+          而是靠大量 warp 切换来隐藏延迟。
+        </p>
+
+        <p>
+          但也要注意，occupancy 不是越高越好。它是重要指标，但不是唯一目标。
+          如果为了提高 occupancy 牺牲了数据复用、增加了访存或让寄存器溢出，性能也可能变差。
+          对入门阶段来说，先理解“足够多的 warp 可以隐藏延迟”就够了。
+        </p>
+
+        <h2>Block 和 Warp 的关系</h2>
+
+        <p>
+          一个 block 里面的线程，会被拆成多个 warp。公式是：
+        </p>
+
+        <pre><code>warp 数 = ceil(blockDim.x / 32)</code></pre>
+
+        <p>
+          常见 block size 对应的 warp 数：
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th><code>blockDim.x</code></th>
+                <th>Warp 数</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>128</code></td>
+                <td><code>128 / 32 = 4</code></td>
+              </tr>
+              <tr>
+                <td><code>256</code></td>
+                <td><code>256 / 32 = 8</code></td>
+              </tr>
+              <tr>
+                <td><code>512</code></td>
+                <td><code>512 / 32 = 16</code></td>
+              </tr>
+              <tr>
+                <td><code>1024</code></td>
+                <td><code>1024 / 32 = 32</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          如果 <code>blockDim.x</code> 不是 32 的倍数，比如 100：
+        </p>
+
+        <pre><code>ceil(100 / 32) = 4 个 warp</code></pre>
+
+        <p>
+          但是最后一个 warp 只有 4 个有效线程，剩下 28 个线程位置浪费。
+          所以 CUDA 里 block size 通常会设成 32 的倍数，比如 128、256、512。
+        </p>
+
+        <h2>完整例子：向量加法</h2>
+
+        <p>
+          假设你有两个数组：
+        </p>
+
+        <pre><code>a = [1, 2, 3, 4, ...]
+b = [10, 20, 30, 40, ...]</code></pre>
+
+        <p>
+          你想算：
+        </p>
+
+        <pre><code>c[i] = a[i] + b[i]</code></pre>
+
+        <p>
+          CUDA kernel 可以这样写：
+        </p>
+
+        <pre><code>__global__ void vectorAdd(float* a, float* b, float* c, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        c[idx] = a[idx] + b[idx];
+    }
+}</code></pre>
+
+        <p>
+          启动代码：
+        </p>
+
+        <pre><code>int blockSize = 256;
+int gridSize = (n + blockSize - 1) / blockSize;
+
+vectorAdd&lt;&lt;&lt;gridSize, blockSize&gt;&gt;&gt;(a, b, c, n);</code></pre>
+
+        <p>
+          这里 <code>blockSize = 256</code>，表示每个 block 256 个线程。
+          <code>gridSize</code> 的计算是为了让总线程数覆盖 <code>n</code> 个元素：
+        </p>
+
+        <pre><code>int gridSize = (n + blockSize - 1) / blockSize;</code></pre>
+
+        <p>
+          比如：
+        </p>
+
+        <pre><code>n = 1000
+blockSize = 256
+gridSize = (1000 + 256 - 1) / 256 = 4</code></pre>
+
+        <p>
+          总线程数是：
+        </p>
+
+        <pre><code>4 × 256 = 1024</code></pre>
+
+        <p>
+          但我们只需要处理 1000 个元素，所以最后 24 个线程会超出范围。
+          因此 kernel 里需要：
+        </p>
+
+        <pre><code>if (idx &lt; n)</code></pre>
+
+        <p>
+          这句判断是防止越界访问。几乎所有处理数组的 CUDA kernel 都会有类似保护。
+        </p>
+
+        <h2>CUDA 执行流程应该怎么理解</h2>
+
+        <p>
+          当你写：
+        </p>
+
+        <pre><code>vectorAdd&lt;&lt;&lt;gridSize, blockSize&gt;&gt;&gt;(a, b, c, n);</code></pre>
+
+        <p>
+          实际发生的是：
+        </p>
+
+        <ol>
+          <li>CPU 发起 kernel 启动请求。</li>
+          <li>GPU 创建一个 grid。</li>
+          <li>Grid 里包含很多 block。</li>
+          <li>GPU 把 block 分配给各个 SM。</li>
+          <li>每个 SM 接收一个或多个 block。</li>
+          <li>Block 内部线程被拆成 warp。</li>
+          <li>Warp 以 32 个线程为一组执行指令。</li>
+          <li>每个 thread 根据自己的 <code>idx</code> 处理对应数据。</li>
+        </ol>
+
+        <p>
+          可以画成：
+        </p>
+
+        <pre><code>GPU
+├── SM 0
+│   ├── Block 0
+│   │   ├── Warp 0: Thread 0  ~ 31
+│   │   ├── Warp 1: Thread 32 ~ 63
+│   │   └── ...
+│   └── Block 80
+│
+├── SM 1
+│   ├── Block 1
+│   └── Block 81
+│
+├── SM 2
+│   ├── Block 2
+│   └── Block 82
+│
+...
+└── SM 79
+    ├── Block 79
+    └── Block 159</code></pre>
+
+        <p>
+          如果 block 数很多，SM 执行完一批 block 后，会继续拿下一批 block。
+          所以 block 数通常要足够多，否则你可能根本喂不满所有 SM。
+        </p>
+
+        <h2>面试里怎么说</h2>
+
+        <p>
+          如果面试官问 CUDA 的执行模型，可以这样回答：
+        </p>
+
+        <blockquote>
+          CUDA 的执行模型是 Grid、Block、Thread 三级结构。一个 kernel 启动后会生成一个 Grid，
+          Grid 由多个 Block 组成，每个 Block 又包含多个 Thread。Block 是调度到 SM 上的基本单位，
+          GPU 会把不同的 Block 分配到不同 SM 上执行。一个 SM 可以同时驻留多个 Block，
+          但数量受线程数、寄存器、shared memory 和硬件上限影响。Thread 在硬件上不是单独调度执行，
+          而是以 Warp 为单位执行，一个 Warp 固定 32 个线程，采用 SIMT 模型。很多 CUDA 性能问题，
+          比如分支发散、内存合并访问、occupancy，本质上都要从 Warp 的执行方式来理解。
+        </blockquote>
+
+        <p>
+          这个回答已经够专业了。再往深处追，就是具体架构、寄存器压力、shared memory、memory hierarchy、
+          Nsight profile 和具体 kernel 优化策略。
+        </p>
+
+        <h2>最应该记住的几个公式</h2>
+
+        <h3>全局线程 id</h3>
+
+        <pre><code>int idx = blockIdx.x * blockDim.x + threadIdx.x;</code></pre>
+
+        <h3>gridSize 计算</h3>
+
+        <pre><code>int gridSize = (n + blockSize - 1) / blockSize;</code></pre>
+
+        <h3>一个 block 里有多少 warp</h3>
+
+        <pre><code>warp 数 = ceil(blockDim.x / 32)</code></pre>
+
+        <h3>256 线程 block 对应多少 warp</h3>
+
+        <pre><code>256 / 32 = 8 个 warp</code></pre>
+
+        <h2>最后用一句话总结</h2>
+
+        <p>
+          CUDA 的核心不是“我启动了很多线程”这么简单，而是：
+        </p>
+
+        <blockquote>
+          你启动很多 block；GPU 把 block 分配给不同 SM；SM 把 block 里的线程拆成 warp；
+          warp 以 32 个线程为单位执行；性能好不好，主要看你的 warp 有没有高效执行、
+          内存访问有没有连续、SM 有没有足够多的活干。
+        </blockquote>
+
+        <p>
+          理解到这个程度，就可以继续往 CUDA 性能优化走了。下一步不是背更多术语，
+          而是拿一个真实 kernel，用 Nsight 看它的 occupancy、memory throughput 和 warp 执行效率。
+        </p>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>A quiet blog.</p>
+    </footer>
+  </body>
+</html>

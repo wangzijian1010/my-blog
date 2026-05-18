@@ -6,7 +6,14 @@
     <link>https://wangzijian1010.github.io/my-blog/</link>
     <atom:link href="https://wangzijian1010.github.io/my-blog/feed.xml" rel="self" type="application/rss+xml" />
     <language>zh-CN</language>
-    <lastBuildDate>Thu, 14 May 2026 00:00:00 +0800</lastBuildDate>
+    <lastBuildDate>Mon, 18 May 2026 00:00:00 +0800</lastBuildDate>
+    <item>
+      <title>CUDA 编程模型入门：SM、Block、Thread 和 Warp 到底怎么配合</title>
+      <link>https://wangzijian1010.github.io/my-blog/posts/cuda-execution-model-sm-block-thread-warp.html</link>
+      <guid>https://wangzijian1010.github.io/my-blog/posts/cuda-execution-model-sm-block-thread-warp.html</guid>
+      <description>一篇从零讲清楚 CUDA 执行模型的入门文章：GPU、SM、Grid、Block、Thread、Warp、全局线程编号、occupancy、分支发散和内存合并访问。</description>
+      <pubDate>Mon, 18 May 2026 00:00:00 +0800</pubDate>
+    </item>
     <item>
       <title>推理部署岗面试复盘：换脸算法、量化精度与那条没接住的国产芯片问题</title>
       <link>https://wangzijian1010.github.io/my-blog/posts/inference-deployment-interview-review.html</link>
