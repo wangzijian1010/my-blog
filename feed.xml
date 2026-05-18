@@ -8,10 +8,10 @@
     <language>zh-CN</language>
     <lastBuildDate>Mon, 18 May 2026 00:00:00 +0800</lastBuildDate>
     <item>
-      <title>CUDA 编程模型入门：SM、Block、Thread 和 Warp 到底怎么配合</title>
+      <title>CUDA 编程模型入门：SM、Block、Thread、Warp 和内存层级</title>
       <link>https://wangzijian1010.github.io/my-blog/posts/cuda-execution-model-sm-block-thread-warp.html</link>
       <guid>https://wangzijian1010.github.io/my-blog/posts/cuda-execution-model-sm-block-thread-warp.html</guid>
-      <description>一篇从零讲清楚 CUDA 执行模型的入门文章：GPU、SM、Grid、Block、Thread、Warp、全局线程编号、occupancy、分支发散和内存合并访问。</description>
+      <description>一篇从零讲清楚 CUDA 执行模型和内存层级的入门文章：SM、Grid、Block、Thread、Warp、Register、Shared Memory、L1/L2 Cache、Global Memory、occupancy 和 coalesced access。</description>
       <pubDate>Mon, 18 May 2026 00:00:00 +0800</pubDate>
     </item>
     <item>

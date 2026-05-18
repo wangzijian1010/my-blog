@@ -3,14 +3,14 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>CUDA 编程模型入门：SM、Block、Thread 和 Warp 到底怎么配合 | 慢慢写</title>
+    <title>CUDA 编程模型入门：SM、Block、Thread、Warp 和内存层级 | 慢慢写</title>
     <meta
       name="description"
-      content="一篇从零讲清楚 CUDA 执行模型的入门文章：GPU、SM、Grid、Block、Thread、Warp、全局线程编号、occupancy、分支发散和内存合并访问。"
+      content="一篇从零讲清楚 CUDA 执行模型和内存层级的入门文章：SM、Grid、Block、Thread、Warp、Register、Shared Memory、L1/L2 Cache、Global Memory、occupancy 和 coalesced access。"
     >
     <meta property="og:type" content="article">
-    <meta property="og:title" content="CUDA 编程模型入门：SM、Block、Thread 和 Warp 到底怎么配合">
-    <meta property="og:description" content="一篇从零讲清楚 CUDA 执行模型的入门文章：GPU、SM、Grid、Block、Thread、Warp、全局线程编号、occupancy、分支发散和内存合并访问。">
+    <meta property="og:title" content="CUDA 编程模型入门：SM、Block、Thread、Warp 和内存层级">
+    <meta property="og:description" content="一篇从零讲清楚 CUDA 执行模型和内存层级的入门文章：SM、Grid、Block、Thread、Warp、Register、Shared Memory、L1/L2 Cache、Global Memory、occupancy 和 coalesced access。">
     <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/cuda-execution-model-sm-block-thread-warp.html">
     <meta name="twitter:card" content="summary">
     <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
@@ -31,7 +31,7 @@
       <article class="post">
         <header class="post-header">
           <p class="eyebrow">cuda 101</p>
-          <h1>CUDA 编程模型入门：SM、Block、Thread 和 Warp 到底怎么配合</h1>
+          <h1>CUDA 编程模型入门：SM、Block、Thread、Warp 和内存层级</h1>
           <p class="post-meta">
             <time datetime="2026-05-18">2026.05.18</time>
             <span>CUDA</span>
@@ -716,7 +716,7 @@ gridSize = (1000 + 256 - 1) / 256 = 4</code></pre>
 
         <pre><code>256 / 32 = 8 个 warp</code></pre>
 
-        <h2>最后用一句话总结</h2>
+        <h2>执行模型先小结一下</h2>
 
         <p>
           CUDA 的核心不是“我启动了很多线程”这么简单，而是：
@@ -731,6 +731,473 @@ gridSize = (1000 + 256 - 1) / 256 = 4</code></pre>
         <p>
           理解到这个程度，就可以继续往 CUDA 性能优化走了。下一步不是背更多术语，
           而是拿一个真实 kernel，用 Nsight 看它的 occupancy、memory throughput 和 warp 执行效率。
+        </p>
+
+        <h2>补充：CUDA 内存层级应该怎么学</h2>
+
+        <p>
+          学 CUDA 内存层级，不要一上来死背表。正确的学习方式是先建立一个空间感：
+          <strong>离计算单元越近，速度越快、容量越小、作用范围越小；离计算单元越远，
+          速度越慢、容量越大、作用范围越大。</strong>
+        </p>
+
+        <pre><code>Register
+    ↓
+Shared Memory / L1 Cache
+    ↓
+L2 Cache
+    ↓
+Global Memory</code></pre>
+
+        <p>
+          越上面，越像线程和 SM 手边的小工具：快，但小，不能随便共享。
+          越下面，越像整个 GPU 的大仓库：容量大，所有线程都能访问，但延迟高。
+        </p>
+
+        <blockquote>
+          CUDA 优化的核心，就是尽量减少 Global Memory 访问，把频繁复用的数据搬到更快的内存，
+          比如 Register 和 Shared Memory。
+        </blockquote>
+
+        <h3>先背这张面试版表格</h3>
+
+        <p>
+          下面这些 cycle 数字只需要当成数量级理解，不同架构、访问模式、cache 命中情况都会让真实延迟变化。
+          面试里真正重要的是：你能说清每一层的作用范围、速度特点，以及它和性能优化的关系。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>内存类型</th>
+                <th>作用范围</th>
+                <th>速度/延迟</th>
+                <th>大小特点</th>
+                <th>面试理解</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Register</td>
+                <td>单个 thread 私有</td>
+                <td>最快，约 1 cycle</td>
+                <td>每个 SM 约 64K 个 32-bit register</td>
+                <td>存局部变量，最快，但太多会影响 occupancy</td>
+              </tr>
+              <tr>
+                <td>Shared Memory</td>
+                <td>同一个 block 内线程共享</td>
+                <td>很快，约 20 cycles</td>
+                <td>每个 SM 约 100KB 级别</td>
+                <td>CUDA 手写优化核心，常用来做 tiling</td>
+              </tr>
+              <tr>
+                <td>L1 Cache</td>
+                <td>SM 内缓存</td>
+                <td>较快，约 30 cycles</td>
+                <td>和 Shared Memory 共享片上资源</td>
+                <td>自动缓存 global memory 访问</td>
+              </tr>
+              <tr>
+                <td>L2 Cache</td>
+                <td>整张 GPU 共享</td>
+                <td>中等，约 200 cycles</td>
+                <td>几 MB 级别</td>
+                <td>所有 SM 共享的数据缓存</td>
+              </tr>
+              <tr>
+                <td>Global Memory</td>
+                <td>整张 GPU 可访问</td>
+                <td>最慢，约 400-600 cycles</td>
+                <td>3080 Ti 是 12GB 显存</td>
+                <td>大数组、模型权重、输入输出都在这里</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Register：线程自己的小本子</h3>
+
+        <p>
+          Register 是最快的存储。它是单个 thread 私有的，别的线程不能访问。
+          比如：
+        </p>
+
+        <pre><code>float x = input[idx];
+float y = x * 2.0f + 1.0f;
+output[idx] = y;</code></pre>
+
+        <p>
+          这里的 <code>x</code>、<code>y</code>、<code>idx</code> 很可能会被编译器放到 register 里。
+          可以把 register 理解成每个线程手里拿着的小纸条：拿起来最快，但纸条数量有限，
+          而且只能自己看。
+        </p>
+
+        <blockquote>
+          Register 是单线程私有的最快存储，常用于保存局部变量。虽然访问最快，但每个线程用太多
+          register 会降低一个 SM 上能同时驻留的线程数，从而降低 occupancy。
+        </blockquote>
+
+        <h3>Shared Memory：一个 block 的公共黑板</h3>
+
+        <p>
+          Shared Memory 是 CUDA 里非常重要的手写优化工具。它的作用范围是同一个 block 内的线程，
+          不同 block 之间不能共享。可以理解成一个 block 里面所有线程共用的小黑板。
+        </p>
+
+        <pre><code>__shared__ float tile[256];
+
+int tid = threadIdx.x;
+int idx = blockIdx.x * blockDim.x + tid;
+
+tile[tid] = input[idx];
+__syncthreads();
+
+float value = tile[tid];</code></pre>
+
+        <p>
+          <code>__shared__ float tile[256];</code> 声明了一块 block 内共享的 shared memory。
+          <code>__syncthreads();</code> 表示 block 内所有线程同步一下，确保大家都把数据写完了，
+          后面的线程再去读就不会读到未完成的数据。
+        </p>
+
+        <blockquote>
+          Shared Memory 是 block 内线程共享的片上内存，速度远快于 global memory。
+          它常用于 tiling：把 global memory 中会被重复访问的数据提前加载到 shared memory，
+          减少慢速显存访问。
+        </blockquote>
+
+        <h3>L1 Cache：SM 自己的自动缓存</h3>
+
+        <p>
+          L1 Cache 不需要像 shared memory 那样手动声明，它是硬件自动工作的。
+          比如：
+        </p>
+
+        <pre><code>float x = input[idx];</code></pre>
+
+        <p>
+          这个数据从 global memory 读的时候，如果命中 L1，就会快很多。
+          L1 Cache 可以理解成每个 SM 自带的小缓存，和 shared memory 一样都离 SM 很近，
+          都属于片上资源。
+        </p>
+
+        <p>
+          但二者的控制方式不一样：<strong>Shared Memory 是程序员手动控制，
+          L1 Cache 是硬件自动控制。</strong>
+        </p>
+
+        <blockquote>
+          L1 Cache 是 SM 局部缓存，主要缓存 global memory 访问。它由硬件自动管理，
+          而 shared memory 是程序员显式管理。很多架构中 L1 和 shared memory 共享片上存储资源。
+        </blockquote>
+
+        <h3>L2 Cache：整张 GPU 的共享缓存</h3>
+
+        <p>
+          L2 Cache 是全 GPU 共享的，所有 SM 都能通过 L2 访问数据。
+          可以理解成整个工厂的公共仓库缓冲区。
+          如果某个数据会被多个 SM 访问，它有机会留在 L2 里，下次访问就不用直接去 global memory。
+        </p>
+
+        <blockquote>
+          L2 Cache 是所有 SM 共享的缓存层，用来减少对 global memory 的直接访问。
+          多个 SM 之间的数据访问，有可能通过 L2 获得复用。
+        </blockquote>
+
+        <h3>Global Memory：显存，大但慢</h3>
+
+        <p>
+          Global Memory 就是 GPU 显存。RTX 3080 Ti 有 12GB 显存，
+          模型权重、输入图片、输出 tensor、大数组，基本都放在 global memory 里。
+          它容量最大，但延迟最高。
+        </p>
+
+        <pre><code>float x = input[idx];
+output[idx] = x;</code></pre>
+
+        <p>
+          这里的 <code>input</code> 和 <code>output</code> 大概率都在 global memory。
+          所以很多 CUDA kernel 看起来只是简单读写，真正的性能瓶颈却在显存访问。
+        </p>
+
+        <blockquote>
+          Global Memory 是 GPU 上容量最大的内存，所有线程都可以访问，但延迟最高。
+          CUDA 优化通常围绕三件事展开：减少 global memory 访问次数、提高访问连续性、
+          提高带宽利用率。
+        </blockquote>
+
+        <h2>用矩阵乘法理解内存层级</h2>
+
+        <p>
+          矩阵乘法是 CUDA 面试最常见的例子。假设：
+        </p>
+
+        <pre><code>C = A × B</code></pre>
+
+        <p>
+          每个 <code>C</code> 元素都要用到 <code>A</code> 的一行和 <code>B</code> 的一列。
+          最普通的写法大概是：
+        </p>
+
+        <pre><code>for (int k = 0; k &lt; K; k++) {
+    sum += A[row * K + k] * B[k * N + col];
+}</code></pre>
+
+        <p>
+          问题在于：<code>A</code> 和 <code>B</code> 都在 global memory，
+          每次循环都从 global memory 读，global memory 又很慢。
+          如果很多线程反复读取相同区域的数据，却每次都回到显存拿，性能就会很差。
+        </p>
+
+        <h3>Tiling 的核心思路</h3>
+
+        <p>
+          Tiling 的想法是：不要每次都直接从 global memory 读。
+          先把一小块 <code>A</code> 和 <code>B</code> 搬到 shared memory，
+          然后 block 里的线程反复使用这一小块数据。
+        </p>
+
+        <pre><code>Global Memory → Shared Memory → Register → 计算</code></pre>
+
+        <p>
+          换成大白话就是：
+        </p>
+
+        <pre><code>慢速大仓库
+    ↓
+block 内小黑板
+    ↓
+线程自己的小纸条
+    ↓
+计算</code></pre>
+
+        <p>
+          Shared memory 不是魔法，它真正解决的是<strong>数据复用</strong>：
+          一批线程合作从 global memory 读一次，放到 shared memory，
+          然后大家反复用，避免每个线程都重复去 global memory 读很多次。
+        </p>
+
+        <p>
+          所以 shared memory 的主战场不是单纯 copy，而是矩阵乘法、卷积、reduce、scan、transpose
+          这类“同一批数据会被多个线程重复使用”的场景。
+        </p>
+
+        <h2>Coalesced Access 和内存层级的关系</h2>
+
+        <p>
+          Coalesced access 一般翻译成合并访问，或者连续内存访问。
+          它解决的是另一个问题：<strong>如果你不得不访问 global memory，怎么访问得更高效？</strong>
+        </p>
+
+        <p>
+          GPU 喜欢这种访问：
+        </p>
+
+        <pre><code>thread 0  访问 input[0]
+thread 1  访问 input[1]
+thread 2  访问 input[2]
+...
+thread 31 访问 input[31]</code></pre>
+
+        <p>
+          也就是同一个 warp 内，相邻线程访问相邻地址。
+          这样硬件可以把 32 个线程的访问合并成少数几次内存事务。
+        </p>
+
+        <p>
+          不好的访问是：
+        </p>
+
+        <pre><code>thread 0 访问 input[0]
+thread 1 访问 input[1000]
+thread 2 访问 input[2000]
+thread 3 访问 input[3000]</code></pre>
+
+        <p>
+          地址跳得很远，global memory 访问效率就会差。
+          这也是前面讲 warp 时说“让相邻线程访问相邻内存”的原因。
+        </p>
+
+        <blockquote>
+          Shared Memory 是减少 Global Memory 访问次数；Coalesced Access 是让必须发生的
+          Global Memory 访问尽量高效。
+        </blockquote>
+
+        <h2>Occupancy 和内存层级的关系</h2>
+
+        <p>
+          Occupancy 粗略理解就是一个 SM 上同时能挂多少个 warp。
+          为什么需要很多 warp？因为 global memory 很慢。
+          一个 warp 访问 global memory 时，可能要等几百个 cycle。
+        </p>
+
+        <p>
+          这时候 SM 不会原地等，它会切换去执行别的 warp：
+        </p>
+
+        <pre><code>warp A 等 global memory
+SM 执行 warp B
+
+warp B 等 global memory
+SM 执行 warp C
+
+warp C 等 global memory
+SM 执行 warp D</code></pre>
+
+        <p>
+          这叫隐藏内存延迟。Occupancy 的意义，就是让 SM 上有足够多的 warp，
+          当某些 warp 等待慢速内存时，SM 可以切换去执行其他 warp。
+        </p>
+
+        <p>
+          但 occupancy 也会被 register 和 shared memory 限制。
+          如果一个 kernel 每个线程用了很多 register，或者每个 block 用了很多 shared memory，
+          那一个 SM 上能同时驻留的 block 和 warp 就会变少。
+        </p>
+
+        <blockquote>
+          Register 和 shared memory 都是 SM 上的有限资源。每个线程使用的 register 越多、
+          每个 block 使用的 shared memory 越多，一个 SM 能同时驻留的 block/warp 就越少，
+          可能降低 occupancy。因此 CUDA 优化不是简单地多用 shared memory，
+          而是要在数据复用和 occupancy 之间做平衡。
+        </blockquote>
+
+        <h2>两个最小代码例子</h2>
+
+        <h3>普通 global memory 访问</h3>
+
+        <pre><code>__global__ void copyKernel(float* input, float* output, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        output[idx] = input[idx];
+    }
+}</code></pre>
+
+        <p>
+          这个 kernel 做的事情很简单：从 global memory 读 <code>input[idx]</code>，
+          再写回 global memory 的 <code>output[idx]</code>。
+          它计算太少，瓶颈大概率是 global memory bandwidth。
+        </p>
+
+        <pre><code>input[idx] 从 global memory 读
+    ↓
+可能经过 L2
+    ↓
+可能经过 L1
+    ↓
+放到 register
+    ↓
+写回 output[idx] 到 global memory</code></pre>
+
+        <p>
+          所以它不是简单的“读一下写一下”，背后实际走的是整套内存层级。
+        </p>
+
+        <h3>Shared Memory 的代码形式</h3>
+
+        <pre><code>__global__ void sharedExample(float* input, float* output) {
+    __shared__ float smem[256];
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    smem[tid] = input[idx];
+    __syncthreads();
+
+    output[idx] = smem[tid];
+}</code></pre>
+
+        <p>
+          这段代码本身不一定比直接 copy 更快，因为它没有真正的数据复用。
+          但它展示了 shared memory 的基本使用方式：
+          <code>__shared__ float smem[256];</code> 声明 block 内共享数组；
+          每个线程从 global memory 读一个元素到 shared memory；
+          <code>__syncthreads();</code> 确保 block 内线程都写完；
+          最后再从 shared memory 读。
+        </p>
+
+        <p>
+          真正有用的是一个数据被多个线程反复使用的场景，比如矩阵乘法、卷积、reduce、scan 和 transpose。
+        </p>
+
+        <h2>面试里可能怎么问</h2>
+
+        <h3>CUDA 的内存层级有哪些</h3>
+
+        <blockquote>
+          CUDA 中常见的内存层级包括 register、shared memory、L1 cache、L2 cache 和 global memory。
+          Register 是线程私有的，速度最快；shared memory 是 block 内线程共享的片上内存，
+          适合做数据复用；L1 cache 是 SM 级别缓存；L2 cache 是全 GPU 共享缓存；
+          global memory 是显存，容量最大但延迟最高。优化时一般尽量减少 global memory 访问，
+          把可复用数据放到 register 或 shared memory，同时保证 global memory 访问连续合并。
+        </blockquote>
+
+        <h3>Shared Memory 和 Global Memory 有什么区别</h3>
+
+        <blockquote>
+          Global memory 是显存，所有线程都可以访问，容量大但延迟高。Shared memory 是 SM 上的片上内存，
+          只能被同一个 block 内的线程共享，容量小但速度快得多。Shared memory 通常用于缓存 global memory
+          中会被重复使用的数据，比如矩阵乘法里的 tile，从而减少对 global memory 的访问次数。
+        </blockquote>
+
+        <h3>Register 用得越多越好吗</h3>
+
+        <blockquote>
+          不是。Register 访问最快，但每个 SM 的 register 数量有限。如果每个线程使用太多 register，
+          会导致一个 SM 上能同时驻留的线程数或 warp 数减少，从而降低 occupancy。
+          Occupancy 降低后，GPU 隐藏 global memory 延迟的能力可能变差，所以 register 使用需要和 occupancy 做平衡。
+        </blockquote>
+
+        <h3>为什么 Global Memory 慢还要用</h3>
+
+        <blockquote>
+          因为 global memory 容量最大，模型权重、输入输出 tensor、大数组都必须放在 global memory 中。
+          优化不是完全不用 global memory，而是减少不必要的访问，并让访问模式尽量 coalesced，
+          提高带宽利用率。
+        </blockquote>
+
+        <h3>Shared Memory 一定比 L1 Cache 好吗</h3>
+
+        <blockquote>
+          不一定。Shared memory 的优势是程序员可以显式控制数据布局和复用，非常适合 tiling 这种确定的数据复用场景。
+          L1 cache 是硬件自动管理，使用简单但可控性较差。如果访问模式规则、复用明确，shared memory 往往更可控；
+          如果访问模式简单连续，L1 cache 可能已经足够。
+        </blockquote>
+
+        <h2>看到一个 CUDA kernel，先问这 4 个问题</h2>
+
+        <ol>
+          <li>数据主要从哪里来？global memory 还是 shared memory？</li>
+          <li>同一个数据会不会被多个线程重复使用？</li>
+          <li>Warp 内线程访问 global memory 是否连续？</li>
+          <li>Register / shared memory 用量会不会影响 occupancy？</li>
+        </ol>
+
+        <p>
+          这 4 个问题，就是 CUDA 性能分析的入口。先问清楚它们，再谈具体优化手段，
+          你的分析就不会散。
+        </p>
+
+        <h2>把执行模型和内存层级合起来</h2>
+
+        <p>
+          前半篇讲的是：thread 组成 block，block 被调度到 SM，SM 把线程拆成 warp 执行。
+          后半篇讲的是：这些 warp 在执行指令时，数据会从 register、shared memory/L1、L2、global memory
+          这些层级里来回流动。
+        </p>
+
+        <blockquote>
+          CUDA 内存优化的本质，就是用更快、更小、更近的内存，去减少更慢、更大、更远的内存访问。
+        </blockquote>
+
+        <p>
+          所以以后看到 tiling、coalesced access、occupancy，不要把它们当成三块零散知识。
+          它们其实是同一套逻辑：Global Memory 很慢，所以要减少访问次数；如果数据会重复用，
+          就搬到 Shared Memory；如果是线程自己的临时变量，就尽量放 Register；
+          如果必须访问 Global Memory，就让相邻线程访问连续地址；如果访问延迟不可避免，
+          就提高 Occupancy，让更多 warp 帮你隐藏延迟。
         </p>
       </article>
     </main>
