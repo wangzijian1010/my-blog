@@ -3,14 +3,14 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>CUDA 编程模型入门：执行模型、内存层级和转置优化 | 慢慢写</title>
+    <title>CUDA 编程模型入门：执行模型、内存层级、转置和 Reduce | 慢慢写</title>
     <meta
       name="description"
-      content="一篇从零讲清楚 CUDA 执行模型、内存层级和入门性能优化的学习笔记：SM、Grid、Block、Thread、Warp、Register、Shared Memory、coalesced access、矩阵转置、bank conflict、cudaEvent 和 Nsight Compute。"
+      content="一篇从零讲清楚 CUDA 执行模型、内存层级和入门性能优化的学习笔记：SM、Grid、Block、Thread、Warp、Shared Memory、coalesced access、矩阵转置、bank conflict、Reduce、warp shuffle 和 grid-stride loop。"
     >
     <meta property="og:type" content="article">
-    <meta property="og:title" content="CUDA 编程模型入门：执行模型、内存层级和转置优化">
-    <meta property="og:description" content="一篇从零讲清楚 CUDA 执行模型、内存层级和入门性能优化的学习笔记：SM、Grid、Block、Thread、Warp、Register、Shared Memory、coalesced access、矩阵转置、bank conflict、cudaEvent 和 Nsight Compute。">
+    <meta property="og:title" content="CUDA 编程模型入门：执行模型、内存层级、转置和 Reduce">
+    <meta property="og:description" content="一篇从零讲清楚 CUDA 执行模型、内存层级和入门性能优化的学习笔记：SM、Grid、Block、Thread、Warp、Shared Memory、coalesced access、矩阵转置、bank conflict、Reduce、warp shuffle 和 grid-stride loop。">
     <meta property="og:url" content="https://wangzijian1010.github.io/my-blog/posts/cuda-execution-model-sm-block-thread-warp.html">
     <meta name="twitter:card" content="summary">
     <link rel="alternate" type="application/rss+xml" title="慢慢写 RSS" href="../feed.xml">
@@ -31,7 +31,7 @@
       <article class="post">
         <header class="post-header">
           <p class="eyebrow">cuda 101</p>
-          <h1>CUDA 编程模型入门：执行模型、内存层级和转置优化</h1>
+          <h1>CUDA 编程模型入门：执行模型、内存层级、转置和 Reduce</h1>
           <p class="post-meta">
             <time datetime="2026-05-18">2026.05.18</time>
             <span>CUDA</span>
@@ -1978,6 +1978,1061 @@ double gbps = bytes / (ms / 1000.0) / 1e9;</code></pre>
           最后用 cudaEvent 和 Nsight Compute 验证性能差异。
         </blockquote>
 
+        <h2>Day 2：Reduce 优化到底在学什么</h2>
+
+        <p>
+          Day 2 真正要学的不是“求和”，而是 CUDA 优化的完整套路。
+          Reduce 做的事情看起来很简单：
+        </p>
+
+        <pre><code>sum = a[0] + a[1] + a[2] + ... + a[n - 1];</code></pre>
+
+        <p>
+          CPU 上一个 for 循环就能写完。但 GPU 上难点在于：GPU 擅长大量线程并行干活，
+          而 reduce 最终要把很多数合成一个数，天然有“汇聚”和“依赖”。
+          所以 Day 2 的核心是：
+        </p>
+
+        <blockquote>
+          怎么把一个看起来串行的求和问题，改造成 GPU 适合的并行树形规约。
+        </blockquote>
+
+        <p>
+          这一节会继续沿用前面已经讲过的概念：线程索引、shared memory、<code>__syncthreads()</code>、
+          warp divergence、bank conflict、occupancy、memory bound 和 cudaEvent。
+          新概念包括：tree-based reduction、first add during load、volatile、warp shuffle、
+          shuffle mask、grid-stride loop，以及多轮 partial sum 规约。
+        </p>
+
+        <h2>Reduce 本质到底是什么</h2>
+
+        <p>
+          假设有 8 个数：
+        </p>
+
+        <pre><code>a0 a1 a2 a3 a4 a5 a6 a7</code></pre>
+
+        <p>
+          CPU 通常这样算：
+        </p>
+
+        <pre><code>float sum = 0;
+for (int i = 0; i &lt; n; i++) {
+    sum += a[i];
+}</code></pre>
+
+        <p>
+          它的实际顺序更像：
+        </p>
+
+        <pre><code>sum = ((((((a0 + a1) + a2) + a3) + a4) + a5) + a6) + a7</code></pre>
+
+        <p>
+          这是串行的，只有一个执行流在干活。GPU 更希望这样做：
+        </p>
+
+        <pre><code>第 1 轮：
+a0 + a1     a2 + a3     a4 + a5     a6 + a7
+
+第 2 轮：
+a0+a1+a2+a3             a4+a5+a6+a7
+
+第 3 轮：
+a0+a1+a2+a3+a4+a5+a6+a7</code></pre>
+
+        <p>
+          这叫 Tree-based Reduction，也就是树形规约。它的特点是：
+        </p>
+
+        <pre><code>总计算量：O(N)
+规约深度：O(log N)</code></pre>
+
+        <p>
+          比如有 1024 个数，规模变化是：
+        </p>
+
+        <pre><code>1024 → 512 → 256 → 128 → ... → 1</code></pre>
+
+        <p>
+          大概只需要 <code>log2(1024) = 10</code> 轮。
+          GPU 上 reduce 的核心思想，就是每一轮让一半线程把另一半数据加到自己身上，
+          数据规模不断减半。
+        </p>
+
+        <h2>为什么 Reduce 是 CUDA 面试高频</h2>
+
+        <p>
+          Reduce 串起了前面学过的大部分基础优化点：
+        </p>
+
+        <ol>
+          <li>线程索引。</li>
+          <li>Shared memory。</li>
+          <li><code>__syncthreads()</code>。</li>
+          <li>Warp divergence。</li>
+          <li>Bank conflict。</li>
+          <li>Occupancy。</li>
+          <li>Memory bound。</li>
+          <li>Loop unrolling。</li>
+          <li>Warp shuffle。</li>
+          <li>Grid-stride loop。</li>
+          <li>多 block 结果如何再次规约。</li>
+        </ol>
+
+        <p>
+          面试官问 reduce，通常不是想知道你会不会加法，而是想知道：
+          你是否理解一个 CUDA kernel 从低效到高效的演进逻辑。
+        </p>
+
+        <h2>完整 Reduce 不是一个 kernel 就结束</h2>
+
+        <p>
+          这是 reduce 里很容易漏掉的工程细节。
+          假设有 <code>n = 16M</code> 个 float，你不可能只用一个 block 算完整个数组。
+          通常做法是：
+        </p>
+
+        <pre><code>第一轮 kernel：
+每个 block 负责一段数据
+每个 block 算出一个 partial sum
+输出到 output[blockIdx.x]
+
+第二轮：
+再对这些 partial sum 做 reduce
+
+第三轮：
+如果 partial sum 还很多，继续 reduce</code></pre>
+
+        <p>
+          数据流是：
+        </p>
+
+        <pre><code>input[N] → partial_sum[numBlocks] → final_sum[1]</code></pre>
+
+        <p>
+          所以很多教学里的 <code>reduce_v1</code> 到 <code>reduce_v6</code>，
+          本质上通常只是在做 block 内部的一次局部规约，输出一个 block 级 partial sum。
+        </p>
+
+        <blockquote>
+          单个 reduce kernel 通常只完成 block 级规约，得到每个 block 的 partial sum。
+          最终结果需要继续用第二个 kernel 递归规约这些 partial sum，
+          或者把 partial sum 拷回 CPU 做最后求和。工业实现里通常会多轮 kernel，
+          或者用 grid-stride loop 减少 partial sum 数量。
+        </blockquote>
+
+        <h2>V1：Interleaved Addressing 在干什么</h2>
+
+        <p>
+          V1 是最朴素的 shared memory 树形规约：
+        </p>
+
+        <pre><code>for (int s = 1; s &lt; blockDim.x; s *= 2) {
+    if (tid % (2 * s) == 0) {
+        sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+}</code></pre>
+
+        <p>
+          假设 <code>blockDim = 8</code>，一开始 shared memory 里是：
+        </p>
+
+        <pre><code>sdata[0] sdata[1] sdata[2] sdata[3] sdata[4] sdata[5] sdata[6] sdata[7]</code></pre>
+
+        <p>
+          当 <code>s = 1</code>，条件是 <code>tid % 2 == 0</code>，
+          工作线程是 <code>0, 2, 4, 6</code>：
+        </p>
+
+        <pre><code>sdata[0] += sdata[1]
+sdata[2] += sdata[3]
+sdata[4] += sdata[5]
+sdata[6] += sdata[7]</code></pre>
+
+        <p>
+          当 <code>s = 2</code>，条件是 <code>tid % 4 == 0</code>，
+          工作线程是 <code>0, 4</code>：
+        </p>
+
+        <pre><code>sdata[0] += sdata[2]
+sdata[4] += sdata[6]</code></pre>
+
+        <p>
+          当 <code>s = 4</code>，只有 <code>tid = 0</code> 工作：
+        </p>
+
+        <pre><code>sdata[0] += sdata[4]</code></pre>
+
+        <p>
+          最后 <code>sdata[0]</code> 就是整个 block 的 sum。
+        </p>
+
+        <h3>V1 为什么慢</h3>
+
+        <p>
+          Warp divergence 前面已经讲过：一个 warp 里的线程走不同分支，硬件需要分批执行。
+          V1 第一轮就是典型例子：
+        </p>
+
+        <pre><code>thread 0 工作
+thread 1 不工作
+thread 2 工作
+thread 3 不工作
+...</code></pre>
+
+        <p>
+          同一个 warp 内交错工作，一半 lane 空转，这是严重 divergence。
+          另一个问题是控制条件里有：
+        </p>
+
+        <pre><code>tid % (2 * s)</code></pre>
+
+        <p>
+          取模比简单比较、加法、位移更不友好。虽然编译器可能把某些 2 的幂取模优化成位运算，
+          但面试里重点应该放在 divergence，而不是只盯着 <code>%</code>。
+        </p>
+
+        <blockquote>
+          V1 的问题是控制条件复杂，而且会导致严重 warp divergence。
+          <code>%</code> 这种条件判断形式也不如连续区间判断友好，但核心问题仍然是 divergence。
+        </blockquote>
+
+        <h2>V2：为什么能减少 divergence</h2>
+
+        <pre><code>for (int s = 1; s &lt; blockDim.x; s *= 2) {
+    int index = 2 * s * tid;
+    if (index &lt; blockDim.x) {
+        sdata[index] += sdata[index + s];
+    }
+    __syncthreads();
+}</code></pre>
+
+        <p>
+          还是假设 <code>blockDim = 8</code>。
+          当 <code>s = 1</code>：
+        </p>
+
+        <pre><code>index = 2 * tid
+
+tid 0 → index 0
+tid 1 → index 2
+tid 2 → index 4
+tid 3 → index 6
+tid 4 → index 8，不工作</code></pre>
+
+        <p>
+          工作线程变成 <code>tid = 0, 1, 2, 3</code>，它们是连续的。
+          当 <code>s = 2</code>：
+        </p>
+
+        <pre><code>index = 4 * tid
+
+tid 0 → index 0
+tid 1 → index 4
+tid 2 → index 8，不工作</code></pre>
+
+        <p>
+          工作线程是 <code>tid = 0, 1</code>，也是连续的。
+          这比 V1 的“隔一个线程工作一个线程”好很多。
+        </p>
+
+        <p>
+          V2 的改善点是：在较大的 block 里，很多 warp 会变成整个 warp 都工作，
+          或者整个 warp 都不工作，而不是一个 warp 里交错工作。
+        </p>
+
+        <h3>V2 为什么会有 bank conflict</h3>
+
+        <p>
+          Bank conflict 前面在矩阵转置里已经详细解释过。
+          Shared memory 通常可以先按 32 个 bank 理解，float 下标大致用：
+        </p>
+
+        <pre><code>bank = index % 32</code></pre>
+
+        <p>
+          V2 的访问是：
+        </p>
+
+        <pre><code>sdata[index] += sdata[index + s];
+index = 2 * s * tid;</code></pre>
+
+        <p>
+          当 <code>s</code> 变大时，相邻线程访问 shared memory 的地址间隔也变大：
+        </p>
+
+        <pre><code>s = 1: index = 0, 2, 4, 6, ...
+s = 2: index = 0, 4, 8, 12, ...
+s = 4: index = 0, 8, 16, 24, ...</code></pre>
+
+        <p>
+          stride 为 2 时只用一半 bank；stride 为 4 时 bank 利用更差；
+          stride 越大，越容易让多个线程落到同一批 bank。
+        </p>
+
+        <blockquote>
+          V2 把工作线程变成连续线程，减少了 warp divergence；
+          但它通过 <code>index = 2 * s * tid</code> 访问 shared memory，
+          让相邻线程访问地址之间有 stride，可能产生 bank conflict。
+        </blockquote>
+
+        <h2>V3：Sequential Addressing 为什么更好</h2>
+
+        <p>
+          V3 是经典 reduce 版本：
+        </p>
+
+        <pre><code>for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+    if (tid &lt; s) {
+        sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+}</code></pre>
+
+        <p>
+          核心变化是循环方向反过来：
+        </p>
+
+        <pre><code>V1 / V2: s 从小到大
+V3:      s 从大到小</code></pre>
+
+        <p>
+          以 <code>blockDim = 8</code> 为例，第一轮 <code>s = 4</code>，
+          工作线程是 <code>tid = 0, 1, 2, 3</code>：
+        </p>
+
+        <pre><code>sdata[0] += sdata[4]
+sdata[1] += sdata[5]
+sdata[2] += sdata[6]
+sdata[3] += sdata[7]</code></pre>
+
+        <p>
+          左边访问 <code>sdata[0..3]</code>，右边访问 <code>sdata[4..7]</code>，
+          都是连续地址。第二轮 <code>s = 2</code>：
+        </p>
+
+        <pre><code>sdata[0] += sdata[2]
+sdata[1] += sdata[3]</code></pre>
+
+        <p>
+          仍然是连续访问。第三轮 <code>s = 1</code>：
+        </p>
+
+        <pre><code>sdata[0] += sdata[1]</code></pre>
+
+        <p>
+          所以 V3 同时改善两个问题：工作线程连续，减少 divergence；
+          shared memory 访问连续，减少 bank conflict。
+        </p>
+
+        <blockquote>
+          V3 把 stride 访问改成 sequential addressing。每一轮中，
+          活跃线程是连续的 <code>tid &lt; s</code>，并且访问的
+          <code>sdata[tid]</code> 和 <code>sdata[tid + s]</code> 都是连续地址，
+          因此减少了 warp divergence 和 shared memory bank conflict。
+        </blockquote>
+
+        <h2>V4：First Add During Load</h2>
+
+        <p>
+          V4 的关键是：
+        </p>
+
+        <pre><code>int idx = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+sdata[tid] = input[idx] + input[idx + blockDim.x];</code></pre>
+
+        <p>
+          V3 一开始每个 block 只处理 <code>blockDim.x</code> 个元素。
+          如果 <code>blockDim = 256</code>，一个 block 读 256 个数到 shared memory，
+          第一轮 <code>s = 128</code> 时，只有 128 个线程工作，另一半线程很快闲置。
+        </p>
+
+        <p>
+          V4 的想法是：既然第一轮一定是两两相加，为什么不在 load 的时候就加掉？
+          让每个线程读两个数：
+        </p>
+
+        <pre><code>sdata[tid] = input[idx] + input[idx + blockDim.x];</code></pre>
+
+        <p>
+          如果 <code>blockDim = 256</code>，一个 block 实际处理 512 个输入元素，
+          但 shared memory 里只存 256 个 partial sum。
+          这相当于一开始就完成了一轮：
+        </p>
+
+        <pre><code>512 → 256</code></pre>
+
+        <blockquote>
+          V4 的 first add during load 相当于在 global memory load 阶段就完成第一轮规约。
+          每个线程加载两个元素并相加，使每个 block 处理 <code>2 * blockDim</code> 个元素，
+          减少 block 数和后续规约开销，同时提高每个线程的工作量。
+        </blockquote>
+
+        <h3>V4 的边界问题</h3>
+
+        <p>
+          学习版代码经常直接写：
+        </p>
+
+        <pre><code>sdata[tid] = input[idx] + input[idx + blockDim.x];</code></pre>
+
+        <p>
+          但如果 <code>n</code> 不是刚好够，就可能越界。
+          工程里应该写成安全版：
+        </p>
+
+        <pre><code>float sum = 0.0f;
+if (idx &lt; n) {
+    sum += input[idx];
+}
+if (idx + blockDim.x &lt; n) {
+    sum += input[idx + blockDim.x];
+}
+sdata[tid] = sum;</code></pre>
+
+        <p>
+          这和前面向量加法里的 <code>if (idx &lt; n)</code> 是同一类问题：
+          kernel 启动线程数和真实数据规模不一定刚好相等，必须保护边界。
+        </p>
+
+        <h2>V5：为什么要 Unroll Last Warp</h2>
+
+        <p>
+          V5 的关键是把最后一个 warp 的规约单独拿出来：
+        </p>
+
+        <pre><code>for (int s = blockDim.x / 2; s &gt; 32; s &gt;&gt;= 1) {
+    if (tid &lt; s) {
+        sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+}
+
+if (tid &lt; 32) {
+    warpReduce(sdata, tid);
+}</code></pre>
+
+        <p>
+          当前面规约到 <code>s &lt;= 32</code> 时，只剩 <code>tid = 0 ~ 31</code>
+          这 32 个线程在工作，刚好是一个 warp。
+          老 CUDA 代码经常利用 warp-synchronous programming：
+          一个 warp 内线程基本按同一条指令节奏执行，因此最后一个 warp 里可以省掉 block 级
+          <code>__syncthreads()</code>。
+        </p>
+
+        <p>
+          V5 会把最后几轮手动展开：
+        </p>
+
+        <pre><code>sdata[tid] += sdata[tid + 32];
+sdata[tid] += sdata[tid + 16];
+sdata[tid] += sdata[tid + 8];
+sdata[tid] += sdata[tid + 4];
+sdata[tid] += sdata[tid + 2];
+sdata[tid] += sdata[tid + 1];</code></pre>
+
+        <p>
+          这样减少循环和同步开销。
+        </p>
+
+        <h3>V5 里的 volatile 是什么</h3>
+
+        <p>
+          很多 V5 代码会写：
+        </p>
+
+        <pre><code>__device__ void warpReduce(volatile float* sdata, int tid)</code></pre>
+
+        <p>
+          <code>volatile</code> 是新概念。这里它的作用是告诉编译器：
+          这块内存可能被其他执行单元改变，不要把它随便缓存到寄存器里复用，
+          每次都按共享内存读写来处理。
+        </p>
+
+        <p>
+          因为 warp 内线程通过 shared memory 交换数据：
+        </p>
+
+        <pre><code>sdata[tid] += sdata[tid + 16];
+sdata[tid] += sdata[tid + 8];
+...</code></pre>
+
+        <p>
+          如果编译器过度缓存 <code>sdata[tid]</code> 的值，可能导致读不到其他线程刚写入的结果。
+          所以老式 warp-synchronous shared memory reduce 里会用 <code>volatile</code>
+          防止编译器优化破坏线程间通过 shared memory 交换数据。
+        </p>
+
+        <h3>现代 GPU 上 V5 的坑</h3>
+
+        <p>
+          这是面试加分点。早期 GPU 里，一个 warp 内 32 个线程基本可以认为 lockstep 执行。
+          但 Volta 之后引入了 Independent Thread Scheduling，也就是独立线程调度。
+          意味着同一个 warp 内的线程不再总是严格同步推进。
+        </p>
+
+        <p>
+          所以老代码里“反正一个 warp 内天然同步，我不用同步”的假设不再完全安全。
+          更现代的写法应该显式使用：
+        </p>
+
+        <pre><code>__syncwarp();</code></pre>
+
+        <p>
+          或者更推荐用后面要讲的 warp shuffle。
+        </p>
+
+        <blockquote>
+          V5 是经典 Mark Harris reduce 优化中的老式写法，它依赖 warp-synchronous programming。
+          早期架构中一个 warp 内线程 lockstep 执行，所以最后一个 warp 可以省略
+          <code>__syncthreads()</code>，并用 <code>volatile</code> 防止编译器缓存 shared memory。
+          但 Volta 之后有独立线程调度，这种隐式同步假设不再完全安全，
+          现代代码更推荐使用 <code>__syncwarp()</code> 或 warp shuffle。
+        </blockquote>
+
+        <h2>V6：Warp Shuffle 是什么</h2>
+
+        <p>
+          Warp shuffle 是 Day 2 里最重要的新概念之一。它用的是：
+        </p>
+
+        <pre><code>__shfl_down_sync(mask, val, offset)</code></pre>
+
+        <p>
+          它的作用是：让同一个 warp 内的线程直接从另一个线程拿寄存器里的值。
+          以前 warp 内线程交换数据需要：
+        </p>
+
+        <pre><code>thread A 的寄存器 → shared memory → thread B 读取</code></pre>
+
+        <p>
+          有了 shuffle 之后可以变成：
+        </p>
+
+        <pre><code>thread A 的寄存器 → thread B 的寄存器</code></pre>
+
+        <p>
+          少了 shared memory 这一步，也就减少了 shared memory 往返、bank conflict 和同步开销。
+        </p>
+
+        <h3>用 shuffle 做 warp 内 reduce</h3>
+
+        <pre><code>__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}</code></pre>
+
+        <p>
+          假设一个 warp 里 32 个线程，每个线程有一个 <code>val</code>。
+          当 <code>offset = 16</code>：
+        </p>
+
+        <pre><code>lane 0 拿 lane 16 的 val
+lane 1 拿 lane 17 的 val
+lane 2 拿 lane 18 的 val
+...</code></pre>
+
+        <p>
+          前 16 个 lane 持有两两相加结果。
+          当 <code>offset = 8</code>，前 8 个 lane 继续累加；
+          <code>offset = 4, 2, 1</code> 继续规约。
+          最后 lane 0 得到整个 warp 的 sum。
+        </p>
+
+        <h3><code>0xffffffff</code> mask 是什么</h3>
+
+        <p>
+          <code>__shfl_down_sync(0xffffffff, val, offset)</code> 里的
+          <code>0xffffffff</code> 是 32 位全 1，表示 warp 内 32 个 lane 全部参与。
+          每一位代表一个 lane：
+        </p>
+
+        <pre><code>bit 0  → lane 0
+bit 1  → lane 1
+...
+bit 31 → lane 31</code></pre>
+
+        <p>
+          为什么现代 CUDA 要传 mask？因为 Volta 之后有独立线程调度，
+          硬件需要知道哪些线程应该参与这次 warp-level collective 操作。
+          <code>_sync</code> 版本要求显式传 mask，就是为了让参与线程集合明确。
+        </p>
+
+        <blockquote>
+          Mask 用来指定 warp 中哪些 lane 参与本次 shuffle 操作。
+          <code>0xffffffff</code> 表示 32 个 lane 全部参与。
+          Volta 之后由于独立线程调度，warp-level primitive 需要显式 mask 来保证参与线程集合明确。
+        </blockquote>
+
+        <h2>V6 为什么 shared memory 只开 32 个</h2>
+
+        <p>
+          很多 V6 代码只需要：
+        </p>
+
+        <pre><code>__shared__ float sdata[32];</code></pre>
+
+        <p>
+          为什么不是 256？因为 V6 不再让所有线程都通过 shared memory 做规约。
+          它先让每个 warp 内部用 shuffle 规约。
+        </p>
+
+        <p>
+          假设 <code>blockDim = 256</code>：
+        </p>
+
+        <pre><code>256 个线程 = 8 个 warp</code></pre>
+
+        <p>
+          每个 warp 得到一个局部 sum，所以只需要存 8 个 warp 的结果。
+          即使一个 block 有 1024 个线程：
+        </p>
+
+        <pre><code>1024 / 32 = 32 个 warp</code></pre>
+
+        <p>
+          所以开 32 个 float 就够。
+        </p>
+
+        <pre><code>每个线程读数据到寄存器 val
+      ↓
+每个 warp 内部用 shuffle 做 reduce
+      ↓
+每个 warp 的 lane 0 写一个结果到 shared memory
+      ↓
+第一个 warp 读取这些 warp 结果
+      ↓
+再用 shuffle 做一次 reduce
+      ↓
+block 的总和出来</code></pre>
+
+        <h2>V6 的完整逻辑拆解</h2>
+
+        <pre><code>int tid = threadIdx.x;
+int lane = tid % 32;
+int wid = tid / 32;</code></pre>
+
+        <p>
+          含义是：
+        </p>
+
+        <pre><code>lane：当前线程在 warp 内的编号，0~31
+wid： 当前线程属于 block 内第几个 warp</code></pre>
+
+        <p>
+          比如 <code>blockDim = 256</code>：
+        </p>
+
+        <pre><code>tid 0~31   → wid = 0, lane = 0~31
+tid 32~63  → wid = 1, lane = 0~31
+tid 64~95  → wid = 2, lane = 0~31
+...</code></pre>
+
+        <h3>第一步：每个线程读两个元素</h3>
+
+        <p>
+          这里仍然要用安全边界版本：
+        </p>
+
+        <pre><code>float val = 0.0f;
+if (idx &lt; n) {
+    val += input[idx];
+}
+if (idx + blockDim.x &lt; n) {
+    val += input[idx + blockDim.x];
+}</code></pre>
+
+        <h3>第二步：每个 warp 内部 reduce</h3>
+
+        <pre><code>val = warpReduceSum(val);</code></pre>
+
+        <p>
+          执行完后，每个 warp 的 lane 0 持有该 warp 的 sum。
+        </p>
+
+        <h3>第三步：每个 warp 的 lane 0 写 shared memory</h3>
+
+        <pre><code>if (lane == 0) {
+    sdata[wid] = val;
+}</code></pre>
+
+        <p>
+          如果 <code>blockDim = 256</code>，就会写：
+        </p>
+
+        <pre><code>sdata[0] = warp0_sum
+sdata[1] = warp1_sum
+...
+sdata[7] = warp7_sum</code></pre>
+
+        <h3>第四步：同步</h3>
+
+        <pre><code>__syncthreads();</code></pre>
+
+        <p>
+          这里仍然需要同步，因为第一个 warp 接下来要读 <code>sdata</code>，
+          必须保证其他 warp 的 lane 0 已经写完。
+        </p>
+
+        <h3>第五步：第一个 warp 再 reduce 一次</h3>
+
+        <pre><code>val = (tid &lt; blockDim.x / 32) ? sdata[lane] : 0;
+if (wid == 0) {
+    val = warpReduceSum(val);
+}</code></pre>
+
+        <p>
+          如果 <code>blockDim = 256</code>，第一个 warp 的 lane 0 到 lane 7 读取
+          <code>sdata[0]</code> 到 <code>sdata[7]</code>，lane 8 到 lane 31 设为 0。
+          然后第一个 warp 再做一次 shuffle reduce。
+          最后：
+        </p>
+
+        <pre><code>if (tid == 0) {
+    output[blockIdx.x] = val;
+}</code></pre>
+
+        <p>
+          一个 block 的 partial sum 就写出去了。
+        </p>
+
+        <h2>V6 为什么快</h2>
+
+        <p>
+          V6 的优势集中在几个点：
+        </p>
+
+        <ol>
+          <li>Warp 内数据交换不走 shared memory。</li>
+          <li>不需要 <code>volatile</code>。</li>
+          <li>Warp 内规约不需要 <code>__syncthreads()</code>。</li>
+          <li>Shared memory 用量极少。</li>
+          <li>Bank conflict 基本不是主要问题。</li>
+          <li>寄存器级通信延迟低。</li>
+        </ol>
+
+        <blockquote>
+          Warp shuffle 允许同一个 warp 内线程直接交换寄存器中的值，不需要经过 shared memory，
+          因此减少了 shared memory round trip、bank conflict 和同步开销。
+          对于 warp 内规约，shuffle 通常是现代 CUDA 的首选方式。
+        </blockquote>
+
+        <h2>Reduce 为什么是 memory bound</h2>
+
+        <p>
+          Memory bound 前面在转置里已经碰到过：瓶颈主要不是计算单元算不过来，
+          而是内存带宽不够。
+          Reduce 对每个 float 基本只做一次加法：
+        </p>
+
+        <pre><code>读取 4 字节
+做 1 次 add</code></pre>
+
+        <p>
+          算术强度很低，所以瓶颈通常是 global memory bandwidth，而不是 FP32 算力。
+          这也是为什么 reduce benchmark 通常用 GB/s 衡量，而不是 TFLOPS。
+        </p>
+
+        <blockquote>
+          Reduce 是典型 memory-bound kernel。每个元素只参与一次加法，算术强度很低，
+          所以性能主要受 global memory bandwidth 影响。优化目标是减少不必要的访存和同步，
+          并尽可能提高带宽利用率，逼近显存带宽上限。
+        </blockquote>
+
+        <h3>Benchmark 里的 bandwidth 怎么理解</h3>
+
+        <pre><code>float bandwidth = (n * sizeof(float)) / (ms / 1000.0f) / 1e9;</code></pre>
+
+        <p>
+          这里算的是有效输入读取带宽。严格来说还有写 partial output，
+          也就是 <code>output[numBlocks]</code>，但这个数据量远小于 input，
+          所以通常可以忽略。
+        </p>
+
+        <p>
+          如果 <code>n = 16M</code>：
+        </p>
+
+        <pre><code>16M float ≈ 16 * 1024 * 1024 * 4 bytes ≈ 64MB</code></pre>
+
+        <p>
+          如果耗时 <code>0.1ms</code>，有效带宽大约就是：
+        </p>
+
+        <pre><code>64MB / 0.1ms ≈ 640GB/s</code></pre>
+
+        <h3>Benchmark 常见坑</h3>
+
+        <p>
+          计时方法前面已经在转置里碰到过，核心还是 cudaEvent。
+          对 reduce 来说，不要只跑一次 kernel。更稳的做法是：
+        </p>
+
+        <ol>
+          <li>先 warmup 几次。</li>
+          <li>正式计时跑 100 次。</li>
+          <li>取平均时间。</li>
+          <li>kernel 后检查 <code>cudaGetLastError()</code>。</li>
+          <li>确认没有把 <code>cudaMemcpy</code> 算进 kernel 时间。</li>
+        </ol>
+
+        <pre><code>for (int i = 0; i &lt; 10; i++) {
+    reduce_v6&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_out, n);
+}
+
+cudaEventRecord(start);
+for (int i = 0; i &lt; repeat; i++) {
+    reduce_v6&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_out, n);
+}
+cudaEventRecord(stop);
+cudaEventSynchronize(stop);
+
+float ms = 0;
+cudaEventElapsedTime(&ms, start, stop);
+ms /= repeat;</code></pre>
+
+        <h2>如果 input 不是 2 的幂怎么办</h2>
+
+        <p>
+          很多教程默认 <code>n</code> 是 2 的幂，<code>blockDim</code> 也是 2 的幂。
+          比如：
+        </p>
+
+        <pre><code>n = 16M
+blockDim = 256</code></pre>
+
+        <p>
+          但真实工程不一定，所以边界判断必须写：
+        </p>
+
+        <pre><code>float sum = 0.0f;
+if (idx &lt; n) {
+    sum += input[idx];
+}
+if (idx + blockDim.x &lt; n) {
+    sum += input[idx + blockDim.x];
+}</code></pre>
+
+        <p>
+          这样不管 <code>n</code> 是不是 2 的幂，都不会越界。
+          另外，blockDim 仍然建议选择 128、256、512、1024 这类 2 的幂，
+          因为 <code>s &gt;&gt;= 1</code> 的 reduce 循环天然适合这种大小。
+        </p>
+
+        <h2>Grid-stride loop 是什么</h2>
+
+        <p>
+          Grid-stride loop 是 Reduce 进阶里非常常见的新概念。
+          普通写法是每个线程只处理一个元素：
+        </p>
+
+        <pre><code>int idx = blockIdx.x * blockDim.x + threadIdx.x;
+if (idx &lt; n) {
+    ...
+}</code></pre>
+
+        <p>
+          Grid-stride loop 则让一个线程处理多个元素：
+        </p>
+
+        <pre><code>for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+     i &lt; n;
+     i += blockDim.x * gridDim.x) {
+    sum += input[i];
+}</code></pre>
+
+        <p>
+          意思是：线程处理完自己的第一个元素后，跳过整个 grid 的线程数，
+          继续处理下一个属于自己的元素。
+        </p>
+
+        <p>
+          它的好处是：
+        </p>
+
+        <ol>
+          <li><code>n</code> 很大时，不需要启动特别多 block。</li>
+          <li>每个线程可以处理多个元素，提高工作量。</li>
+          <li>更容易处理任意大小输入。</li>
+          <li>可以减少 partial sum 数量。</li>
+        </ol>
+
+        <p>
+          现代 reduce 常常结合 first add during load 写成：
+        </p>
+
+        <pre><code>float sum = 0.0f;
+for (int i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+     i &lt; n;
+     i += blockDim.x * gridDim.x * 2) {
+    sum += input[i];
+    if (i + blockDim.x &lt; n) {
+        sum += input[i + blockDim.x];
+    }
+}</code></pre>
+
+        <p>
+          然后再对每个线程的 <code>sum</code> 做 block 内 reduce。
+          这里 <code>sum</code> 是线程私有局部变量，前面讲过，它通常会放在 register 里。
+        </p>
+
+        <h2>不要背 6 个版本，要背演进故事线</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>版本</th>
+                <th>核心写法</th>
+                <th>解决了什么</th>
+                <th>还有什么问题</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>V1</td>
+                <td><code>tid % (2*s) == 0</code></td>
+                <td>最基础树形规约</td>
+                <td>Warp divergence，取模开销</td>
+              </tr>
+              <tr>
+                <td>V2</td>
+                <td><code>index = 2*s*tid</code></td>
+                <td>工作线程更连续，减少 divergence</td>
+                <td>Stride shared memory 访问，bank conflict</td>
+              </tr>
+              <tr>
+                <td>V3</td>
+                <td><code>s = blockDim/2 → 1</code></td>
+                <td>Sequential addressing，减少 bank conflict</td>
+                <td>一开始一半线程很快闲置</td>
+              </tr>
+              <tr>
+                <td>V4</td>
+                <td>Load 两个元素先相加</td>
+                <td>Block 数减半，提高线程工作量</td>
+                <td>最后 warp 仍有同步和循环开销</td>
+              </tr>
+              <tr>
+                <td>V5</td>
+                <td>Unroll last warp</td>
+                <td>减少最后 warp 的同步和循环</td>
+                <td>老式 warp-synchronous，现代 GPU 有坑</td>
+              </tr>
+              <tr>
+                <td>V6</td>
+                <td>Warp shuffle</td>
+                <td>寄存器级规约，减少 shared memory 和同步</td>
+                <td>需要理解 mask、lane、wid、边界</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>面试里怎么讲 Reduce 演进</h2>
+
+        <blockquote>
+          我会先从 block 内 shared memory reduce 开始。最朴素的 V1 使用 interleaved addressing，
+          通过 <code>tid % (2*s) == 0</code> 选择工作线程，但这会导致严重 warp divergence，
+          而且取模开销也不友好。V2 把工作线程变成连续线程，减少 divergence，
+          但由于 <code>index = 2*s*tid</code> 产生 stride shared memory 访问，会引入 bank conflict。
+          V3 改成 sequential addressing，从 <code>blockDim/2</code> 开始向下规约，
+          让活跃线程连续访问 <code>sdata[tid]</code> 和 <code>sdata[tid+s]</code>，
+          减少 bank conflict。V4 进一步在 load 阶段让每个线程读取两个元素并相加，
+          相当于提前做一轮 reduce，减少 block 数。V5 把最后一个 warp 手动展开，
+          减少 <code>__syncthreads()</code> 和循环开销，但它依赖旧式 warp-synchronous programming。
+          现代 GPU 更推荐 V6，用 <code>__shfl_down_sync</code> 在 warp 内直接做寄存器级规约，
+          然后每个 warp 写一个 partial sum 到 shared memory，最后由第一个 warp 再规约一次。
+          Reduce 本质是 memory-bound，所以最终优化目标是提高 global memory bandwidth 利用率。
+        </blockquote>
+
+        <h2>老师学习版代码里的几个坑</h2>
+
+        <h3>V4 / V5 / V6 都要加边界判断</h3>
+
+        <p>
+          不要直接写：
+        </p>
+
+        <pre><code>input[idx] + input[idx + blockDim.x]</code></pre>
+
+        <p>
+          要写：
+        </p>
+
+        <pre><code>float val = 0.0f;
+if (idx &lt; n) {
+    val += input[idx];
+}
+if (idx + blockDim.x &lt; n) {
+    val += input[idx + blockDim.x];
+}</code></pre>
+
+        <h3>BlockDim 最好是 2 的幂</h3>
+
+        <p>
+          比如 128、256、512、1024。因为 reduce 循环里的 <code>s &gt;&gt;= 1</code>
+          默认适合 2 的幂。
+        </p>
+
+        <h3>一个 kernel 只得到 partial sum</h3>
+
+        <p>
+          不要以为：
+        </p>
+
+        <pre><code>output[blockIdx.x] = sdata[0];</code></pre>
+
+        <p>
+          之后就结束了。如果 grid 有 1024 个 block，输出就是 1024 个 partial sum，
+          还要继续 reduce。
+        </p>
+
+        <h3>V5 老写法不要当现代最佳实践</h3>
+
+        <p>
+          V5 是为了理解历史优化路线。现代代码更推荐 warp shuffle，
+          或者至少显式使用 <code>__syncwarp()</code>。
+        </p>
+
+        <h2>Day 2 自查清单</h2>
+
+        <ol>
+          <li>我知道 Reduce 为什么不能直接把 CPU for 循环思想搬到 GPU。</li>
+          <li>我能画出 8 个元素的树形规约。</li>
+          <li>我知道 V1 为什么 warp divergence。</li>
+          <li>我知道 V2 为什么减少 divergence。</li>
+          <li>我知道 V2 为什么可能有 bank conflict。</li>
+          <li>我知道 V3 为什么叫 sequential addressing。</li>
+          <li>我知道 V4 为什么每个线程先 load 两个元素。</li>
+          <li>我知道 V5 为什么展开最后一个 warp。</li>
+          <li>我知道 <code>volatile</code> 的作用和现代 GPU 的问题。</li>
+          <li>我知道 <code>__shfl_down_sync</code> 在做什么。</li>
+          <li>我知道 mask 是什么。</li>
+          <li>我知道为什么 V6 只需要 shared memory 32 个 float。</li>
+          <li>我知道 Reduce 是 memory bound。</li>
+          <li>我知道 <code>n</code> 不是 2 的幂时要做边界处理。</li>
+          <li>我知道最终结果可能需要多轮 reduce。</li>
+        </ol>
+
+        <h2>Day 2 最短理解版本</h2>
+
+        <blockquote>
+          Reduce 优化的本质，是让线程先在寄存器里多干一点，再用 shared memory 做 block 内规约，
+          避免 warp divergence 和 bank conflict，最后用 warp shuffle 替代 shared memory 完成 warp 内通信，
+          尽可能减少同步和访存开销，让性能接近显存带宽上限。
+        </blockquote>
+
+        <pre><code>V1 解决能不能并行
+V2 解决线程分歧
+V3 解决 shared memory 访问
+V4 解决线程工作量不足
+V5 解决最后 warp 同步开销
+V6 解决 warp 内通信效率</code></pre>
+
         <h2>把执行模型和内存层级合起来</h2>
 
         <p>
@@ -1985,6 +3040,8 @@ double gbps = bytes / (ms / 1000.0) / 1e9;</code></pre>
           第二部分讲的是：这些 warp 在执行指令时，数据会从 register、shared memory/L1、L2、global memory
           这些层级里来回流动。第三部分讲的是：真正写 kernel 时，性能差异经常来自 global memory 是否连续访问、
           shared memory 是否真的带来数据复用，以及 shared memory 内部有没有 bank conflict。
+          第四部分讲的是：像 reduce 这种看起来串行的汇聚问题，如何通过树形规约、first add during load、
+          warp shuffle 和多轮 partial sum 变成 GPU 适合的并行问题。
         </p>
 
         <blockquote>
